@@ -212,39 +212,52 @@ join_nrc_ops <- function(df, ops_features) {
       ))
     )
 
-  # Normalize facility names for matching
-  df <- df %>%
-    mutate(.facility_lower = tolower(trimws(facility)))
+  # --- Build site-level name from unit-level ops data ---
+  # Ops data has unit-level names like "beaver valley 1", "beaver valley 2"
+  # Events have site-level names like "beaver valley"
+  # Strategy: strip trailing unit numbers from ops names to create a site key,
+  # then aggregate numeric ops features to site-quarter level (mean across units)
 
   ops_join <- ops %>%
-    mutate(.facility_lower = tolower(trimws(facility_unit)))
+    mutate(
+      .facility_lower = tolower(trimws(facility_unit)),
+      # Strip trailing unit numbers: "beaver valley 1" -> "beaver valley"
+      # Also handles "beaver valley-1" and "unit 1" patterns
+      .facility_site = stringr::str_trim(
+        stringr::str_remove(.facility_lower, "\\s*[-]?\\s*\\d+\\s*$")
+      )
+    )
 
-  # Select columns to join: facility key, quarter key, and all _between/_within cols
+  # Identify numeric columns to aggregate (between/within + raw ops vars)
   between_within_cols <- names(ops_join)[grepl("_between$|_within$", names(ops_join))]
-
-  # Also include raw ops vars that might be useful (action_matrix_col, findings_count, etc.)
   raw_ops_cols <- intersect(NRC_OPS_VARS, names(ops_join))
+  numeric_ops_cols <- unique(c(between_within_cols, raw_ops_cols))
+  numeric_ops_cols <- intersect(numeric_ops_cols, names(ops_join))
 
-  join_cols <- unique(c(".facility_lower", "quarter_start", between_within_cols, raw_ops_cols))
-  join_cols <- intersect(join_cols, names(ops_join))
-
-  ops_join <- ops_join %>%
-    select(all_of(join_cols)) %>%
+  # Aggregate to site × quarter level (mean across units at same site)
+  ops_site <- ops_join %>%
+    group_by(.facility_site, quarter_start) %>%
+    summarise(
+      across(all_of(numeric_ops_cols), ~ mean(.x, na.rm = TRUE)),
+      .n_units = n(),
+      .groups = "drop"
+    ) %>%
     rename(.prior_quarter_start = quarter_start)
 
-  # Deduplicate ops (in case of multiple rows per facility-quarter)
-  ops_join <- ops_join %>% distinct(.facility_lower, .prior_quarter_start, .keep_all = TRUE)
+  # Normalize event facility names
+  df <- df %>%
+    mutate(.facility_site = tolower(trimws(facility)))
 
   # Join
   df <- df %>%
-    left_join(ops_join, by = c(".facility_lower", ".prior_quarter_start"))
+    left_join(ops_site, by = c(".facility_site", ".prior_quarter_start"))
 
   # Report join rate
-  ops_check_col <- if (length(between_within_cols) > 0) between_within_cols[1] else raw_ops_cols[1]
+  ops_check_col <- if (length(numeric_ops_cols) > 0) numeric_ops_cols[1] else NULL
   if (!is.null(ops_check_col) && ops_check_col %in% names(df)) {
     n_matched <- sum(!is.na(df[[ops_check_col]]))
-    message(sprintf("  Ops join: %d/%d events matched (%.1f%%)",
-                    n_matched, nrow(df), 100 * n_matched / nrow(df)))
+    message(sprintf("  Ops join: %d/%d events matched (%.1f%%) [site-level, %d ops site-quarters]",
+                    n_matched, nrow(df), 100 * n_matched / nrow(df), nrow(ops_site)))
   }
 
   # Clean temp columns
@@ -305,6 +318,28 @@ prepare_nrc_config_data <- function(parquet_path, config_id, nrc_events,
   df <- df %>%
     left_join(events, by = "report_id") %>%
     filter(!is.na(event_date))
+
+  # Filter to power reactor facilities only
+  # The event data includes materials licensees, research reactors, etc.
+  # Keep only facilities that match a known power reactor site name
+  if (!is.null(ops_features) && nrow(ops_features) > 0) {
+    # Build set of known power reactor site names from ops data
+    ops_sites <- ops_features %>%
+      mutate(.fac = tolower(trimws(facility_unit))) %>%
+      mutate(.site = stringr::str_trim(stringr::str_remove(.fac, "\\s*[-]?\\s*\\d+\\s*$"))) %>%
+      pull(.site) %>%
+      unique()
+
+    df <- df %>%
+      mutate(.fac_lower = tolower(trimws(facility))) %>%
+      filter(.fac_lower %in% ops_sites) %>%
+      select(-.fac_lower)
+
+    if (nrow(df) == 0) {
+      warning(sprintf("Config %s: No power reactor events after filtering", config_id))
+      return(NULL)
+    }
+  }
 
   # Filter to facilities with enough events
   df <- df %>%
