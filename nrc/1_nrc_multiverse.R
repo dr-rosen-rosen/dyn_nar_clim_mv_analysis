@@ -346,7 +346,7 @@ fit_ordinal_model <- function(data, climate_var, config_id, outcome = "ordinal_s
 #' @return List of tibble rows (one per model)
 analyze_single_config_nrc <- function(parquet_path, config_id, nrc_events,
                                       ops_features = NULL,
-                                      outcomes = c("binary_scram", "ordinal_scram", "emerg_class"),
+                                      outcomes = c("ordinal_scram", "emerg_class"),
                                       min_reports = 20) {
 
   # Prepare data
@@ -419,7 +419,7 @@ run_nrc_multiverse <- function(cfg_dir,
                                 nrc_events,
                                 ops_features = NULL,
                                 config_ids = NULL,
-                                outcomes = c("binary_scram", "ordinal_scram", "emerg_class"),
+                                outcomes = c("ordinal_scram", "emerg_class"),
                                 n_workers = 4L,
                                 output_path = "results/nrc_multiverse_results.parquet",
                                 min_reports = 20) {

@@ -1,7 +1,13 @@
+# 1_rail_multiverse_glmmtmb_w_ops.R
 # Rail Multiverse Analysis - Production Script (glmmTMB)
 # Outcomes: injuries (hurdle), fatalities (hurdle), costs (hurdle with gamma)
 # With operational covariates: train_miles, passenger_miles, staff_hours
 # Mike Rose - Safety Climate Analysis
+#
+# This script sources shared code from common/ and provides:
+#   - fit_single_rail_model()      : Fit one hurdle model for a given climate var
+#   - analyze_single_config_rail() : Run all window analyses for one config
+#   - run_rail_multiverse()        : Parallel batch runner across all configs
 
 library(tidyverse)
 library(glmmTMB)
@@ -12,464 +18,18 @@ library(glue)
 library(here)
 library(slider)
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-
-# Window specifications
-WINDOW_SPECS <- list(
-  sma = tibble(window_size = c(3, 5, 10, 20)),
-  ewma = tribble(
-    ~lag_days, ~halflife_days,
-    180,  60,
-    180,  90,
-    360,  90,
-    360,  180,
-    540,  180,
-    540,  270,
-    720,  180,
-    720,  360,
-    900,  270,
-    900,  450,
-    1080, 360,
-    1080, 540
-  )
-)
-
-# Operational variables configuration
-OPS_VARS <- c("train_miles", "passenger_miles", "staff_hours")
-OPS_ROLL_K <- 12L    # 12-month rolling window for between/within decomposition
-OPS_LAG_K <- 1L      # 1-month lag to ensure temporal ordering
-OPS_MIN_HIST <- 6L   # Minimum 6 months of history before computing features
-
-# Expected format for operational data file:
-# - org_id: Organization identifier (must match rail_raw)
-# - yearmonth: Date in monthly format (e.g., "2020-01-01" for Jan 2020)
-# - train_miles: Monthly train miles
-# - passenger_miles: Monthly passenger miles  
-# - staff_hours: Monthly staff hours
-
-# Model specifications for each outcome
-# Now includes operational covariates (between and within for each)
-MODEL_FORMULAS <- list(
-  injuries = list(
-    conditional = paste0(
-      "total_persons_injured ~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    ),
-    zero_inflation = paste0(
-      "~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    )
-  ),
-  fatalities = list(
-    conditional = paste0(
-      "total_persons_killed ~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    ),
-    zero_inflation = paste0(
-      "~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    )
-  ),
-  costs = list(
-    conditional = paste0(
-      "total_damage_cost ~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    ),
-    zero_inflation = paste0(
-      "~ yearmonth_num_c + sin_month + cos_month + ",
-      "train_miles_between + train_miles_within + ",
-      "passenger_miles_between + passenger_miles_within + ",
-      "staff_hours_between + staff_hours_within + ",
-      "CLIMATE_VAR + (1 | org_id)"
-    )
-  )
-)
-
-# ==============================================================================
-# OPERATIONAL DATA PROCESSING
-# ==============================================================================
-
-#' Create operational features with rolling window between/within decomposition
-#' 
-#' This function operates on MONTHLY operational data (not event-level data).
-#' For each operational variable, creates:
-#' - {var}_between: Rolling mean of lagged values (stable operational scale)
-#' - {var}_within: Deviation from rolling mean (temporal fluctuations)
-#' 
-#' @param ops_df Data frame with monthly operational data (one row per org-month)
-#' @param date_var Name of yearmonth variable (should be Date class, first of month)
-#' @param org_var Name of organization ID variable
-#' @param vars Vector of operational variable names
-#' @param lag_k Lag in months (default 1)
-#' @param roll_k Rolling window size in months (default 12)
-#' @param min_hist Minimum history required before computing features (default 6)
-#' @param log1p_transform Whether to apply log1p transformation (default TRUE)
-#' @param standardize Whether to standardize final features (default TRUE)
-#' @return Data frame with org_id, yearmonth, and operational features ready for joining
-make_ops_features_rolling <- function(ops_df,
-                                      date_var = "yearmonth",
-                                      org_var  = "org_id",
-                                      vars     = OPS_VARS,
-                                      lag_k    = OPS_LAG_K,
-                                      roll_k   = OPS_ROLL_K,
-                                      min_hist = OPS_MIN_HIST,
-                                      log1p_transform = TRUE,
-                                      standardize = TRUE) {
-  
-  # Check required columns exist
-  required_cols <- c(date_var, org_var, vars)
-  missing_cols <- setdiff(required_cols, names(ops_df))
-  if (length(missing_cols) > 0) {
-    stop(sprintf("Missing required columns in operational data: %s",
-                 paste(missing_cols, collapse = ", ")))
-  }
-  
-  # Ensure yearmonth is Date class
-  ops_df <- ops_df %>%
-    mutate(!!date_var := as.Date(.data[[date_var]]))
-  
-  ops_df <- ops_df %>%
-    arrange(.data[[org_var]], .data[[date_var]]) %>%
-    group_by(.data[[org_var]])
-  
-  # Step 1: Log transform if requested
-  for (v in vars) {
-    col_name <- paste0(v, "_log")
-    if (log1p_transform) {
-      ops_df <- ops_df %>% mutate(!!col_name := log1p(.data[[v]]))
-    } else {
-      ops_df <- ops_df %>% mutate(!!col_name := .data[[v]])
-    }
-  }
-  
-  # Step 2: Create lagged values
-  for (v in vars) {
-    log_col <- paste0(v, "_log")
-    lag_col <- paste0(v, "_lag", lag_k)
-    ops_df <- ops_df %>% mutate(!!lag_col := dplyr::lag(.data[[log_col]], lag_k))
-  }
-  
-  # Step 3: Compute rolling mean of lagged values (between component)
-  for (v in vars) {
-    lag_col <- paste0(v, "_lag", lag_k)
-    between_col <- paste0(v, "_between_raw")
-    ops_df <- ops_df %>%
-      mutate(
-        !!between_col := slider::slide_dbl(
-          .data[[lag_col]],
-          mean,
-          .before = roll_k - 1,
-          .complete = FALSE,
-          na.rm = TRUE
-        )
-      )
-  }
-  
-  # Step 4: Compute within component (lagged value minus rolling mean)
-  for (v in vars) {
-    lag_col <- paste0(v, "_lag", lag_k)
-    between_col <- paste0(v, "_between_raw")
-    within_col <- paste0(v, "_within_raw")
-    ops_df <- ops_df %>%
-      mutate(!!within_col := .data[[lag_col]] - .data[[between_col]])
-  }
-  
-  # Step 5: Count history and enforce minimum
-  first_lag_col <- paste0(vars[1], "_lag", lag_k)
-  ops_df <- ops_df %>%
-    mutate(ops_hist_n = cumsum(!is.na(.data[[first_lag_col]])))
-  
-  # Set features to NA if insufficient history
-  for (v in vars) {
-    between_raw <- paste0(v, "_between_raw")
-    within_raw <- paste0(v, "_within_raw")
-    ops_df <- ops_df %>%
-      mutate(
-        !!between_raw := ifelse(ops_hist_n >= min_hist, .data[[between_raw]], NA_real_),
-        !!within_raw := ifelse(ops_hist_n >= min_hist, .data[[within_raw]], NA_real_)
-      )
-  }
-  
-  ops_df <- ops_df %>% ungroup()
-  
-  # Step 6: Standardize if requested (across all data)
-  if (standardize) {
-    for (v in vars) {
-      between_raw <- paste0(v, "_between_raw")
-      within_raw <- paste0(v, "_within_raw")
-      between_final <- paste0(v, "_between")
-      within_final <- paste0(v, "_within")
-      
-      # Standardize between
-      between_mean <- mean(ops_df[[between_raw]], na.rm = TRUE)
-      between_sd <- sd(ops_df[[between_raw]], na.rm = TRUE)
-      if (is.na(between_sd) || between_sd < 1e-10) between_sd <- 1
-      ops_df[[between_final]] <- (ops_df[[between_raw]] - between_mean) / between_sd
-      
-      # Standardize within
-      within_mean <- mean(ops_df[[within_raw]], na.rm = TRUE)
-      within_sd <- sd(ops_df[[within_raw]], na.rm = TRUE)
-      if (is.na(within_sd) || within_sd < 1e-10) within_sd <- 1
-      ops_df[[within_final]] <- (ops_df[[within_raw]] - within_mean) / within_sd
-    }
-  } else {
-    # Just rename raw to final
-    for (v in vars) {
-      ops_df[[paste0(v, "_between")]] <- ops_df[[paste0(v, "_between_raw")]]
-      ops_df[[paste0(v, "_within")]] <- ops_df[[paste0(v, "_within_raw")]]
-    }
-  }
-  
-  # Select only the columns needed for joining
-  output_cols <- c(org_var, date_var, 
-                   paste0(vars, "_between"),
-                   paste0(vars, "_within"))
-  
-  ops_df <- ops_df %>% select(all_of(output_cols))
-  
-  return(ops_df)
+# Source shared modules
+# Adjust path as needed depending on working directory
+common_dir <- file.path(here::here(), "rail/common")
+if (!dir.exists(common_dir)) {
+  # Fallback: try relative to script location
+  common_dir <- "common"
 }
+source(file.path(common_dir, "config.R"))
+source(file.path(common_dir, "data_prep.R"))
+# formulas.R not strictly needed for the multiverse script but available if needed
+# source(file.path(common_dir, "formulas.R"))
 
-
-#' Load and prepare operational features from file
-#' 
-#' @param ops_path Path to operational data file (CSV or Parquet)
-#' @param ... Additional arguments passed to make_ops_features_rolling
-#' @return Data frame with operational features ready for joining
-load_and_prepare_ops_features <- function(ops_path, 
-                                          ops_vars = c("train_miles", "passenger_miles", "staff_hours"),
-                                          sentinel_values = c(-11111, -1111, -111, 99999),
-                                          ...) {
-  
-  if (is.null(ops_path) || !file.exists(ops_path)) {
-    message("No operational data file provided or file not found. Proceeding without operational covariates.")
-    return(NULL)
-  }
-  
-  # Load based on file extension
-  ext <- tools::file_ext(ops_path)
-  if (ext == "parquet") {
-    ops_raw <- arrow::read_parquet(ops_path)
-  } else if (ext %in% c("csv", "CSV")) {
-    ops_raw <- readr::read_csv(ops_path, show_col_types = FALSE)
-  } else {
-    stop(sprintf("Unsupported file format: %s. Use .csv or .parquet", ext))
-  }
-  # After loading ops_raw, ensure yearmonth is proper Date:
-  ops_raw <- ops_raw %>%
-    mutate(yearmonth = as.Date(yearmonth))
-  
-  cat(sprintf("Loaded operational data: %d rows, %d organizations\n",
-              nrow(ops_raw), n_distinct(ops_raw$org_id)))
-  
-  # --- 1. Replace sentinel values with NA ---
-  # Common FRA placeholders: -11111, -1111, 99999, etc.
-  ops_vars_present <- intersect(ops_vars, names(ops_raw))
-  
-  if (length(ops_vars_present) > 0) {
-    n_sentinels <- ops_raw %>%
-      summarise(across(all_of(ops_vars_present), 
-                       ~sum(.x %in% sentinel_values, na.rm = TRUE))) %>%
-      rowSums()
-    
-    if (n_sentinels > 0) {
-      cat(sprintf("Replacing %d sentinel values (%s) with NA\n", 
-                  n_sentinels, paste(sentinel_values, collapse = ", ")))
-    }
-    
-    ops_raw <- ops_raw %>%
-      mutate(across(all_of(ops_vars_present), 
-                    ~if_else(.x %in% sentinel_values, NA_real_, as.numeric(.x))))
-    
-    # --- 2. Replace negative values with NA (shouldn't have negative miles/hours) ---
-    n_negative <- ops_raw %>%
-      summarise(across(all_of(ops_vars_present), 
-                       ~sum(.x < 0, na.rm = TRUE))) %>%
-      rowSums()
-    
-    if (n_negative > 0) {
-      cat(sprintf("Replacing %d negative values with NA\n", n_negative))
-    }
-    
-    ops_raw <- ops_raw %>%
-      mutate(across(all_of(ops_vars_present), 
-                    ~if_else(.x < 0, NA_real_, .x)))
-  }
-  
-  # --- 3. Deduplicate: keep distinct org_id + yearmonth + ops vars ---
-  # First check for duplicates
-  key_cols <- c("org_id", "yearmonth", ops_vars_present)
-  key_cols <- intersect(key_cols, names(ops_raw))
-  
-  n_before <- nrow(ops_raw)
-  
-  # Option A: Take distinct rows on key columns
-  ops_raw <- ops_raw %>%
-    distinct(across(all_of(key_cols)), .keep_all = TRUE)
-  
-  n_after_distinct <- nrow(ops_raw)
-  
-  if (n_before != n_after_distinct) {
-    cat(sprintf("Removed %d exact duplicate rows\n", n_before - n_after_distinct))
-  }
-  
-  # Option B: If still duplicates on (org_id, yearmonth), aggregate
-  n_dupes <- ops_raw %>%
-    group_by(org_id, yearmonth) %>%
-    filter(n() > 1) %>%
-    nrow()
-  
-  if (n_dupes > 0) {
-    cat(sprintf("Aggregating %d remaining duplicate org-months (summing ops vars)\n", n_dupes))
-    
-    ops_raw <- ops_raw %>%
-      group_by(org_id, yearmonth) %>%
-      summarise(
-        across(all_of(ops_vars_present), ~sum(.x, na.rm = TRUE)),
-        .groups = "drop"
-      )
-  }
-  
-  # Final duplicate check
-  final_dupes <- ops_raw %>%
-    group_by(org_id, yearmonth) %>%
-    filter(n() > 1) %>%
-    nrow()
-  
-  if (final_dupes > 0) {
-    warning(sprintf("Still have %d duplicate org-months after cleaning!", final_dupes))
-  }
-  
-  cat(sprintf("Clean operational data: %d rows, %d organizations\n",
-              nrow(ops_raw), n_distinct(ops_raw$org_id)))
-  
-  # --- 4. Create features ---
-  ops_features <- make_ops_features_rolling(ops_raw, ...)
-  
-  cat(sprintf("Created operational features: %d org-months with complete data\n",
-              sum(complete.cases(ops_features))))
-  
-  return(ops_features)
-}
-
-# Helper to align column names and date format from raw FRA operational data download
-format_ops_data <- function(ops_path, overwrite = FALSE) {
-  ops_df <- read.csv(ops_path) %>%
-    rename(
-      org_id = RAILROAD,
-      train_miles = TOTMI, # there are other breakdowns for miles, this is total
-      passenger_miles = PASSMI,
-      staff_hours = EMPHRS) %>%
-    mutate(
-      IYR_full = if_else(between(IYR,0,25),2000+IYR,1900+IYR),
-      yearmonth = paste0(IYR_full,"-",IMO,"-01")
-    )
-  if (overwrite) {
-    write_csv(ops_df,ops_path)
-  }
-  return(ops_df)
-}
-
-# ==============================================================================
-# WINDOW CREATION FUNCTIONS
-# ==============================================================================
-
-ewma_time_decay_irregular_lag <- function(x, dates, window_days, half_life_days, min_n = 1) {
-  n <- length(x)
-  result <- rep(NA_real_, n)
-  lambda <- log(2) / half_life_days
-  
-  for (i in 2:n) {
-    lookback_start <- dates[i] - window_days
-    prior_idx <- which(dates[1:(i-1)] >= lookback_start)
-    
-    if (length(prior_idx) >= min_n) {
-      prior_dates <- dates[prior_idx]
-      prior_vals <- x[prior_idx]
-      
-      valid <- !is.na(prior_vals)
-      if (sum(valid) >= min_n) {
-        prior_dates <- prior_dates[valid]
-        prior_vals <- prior_vals[valid]
-        
-        time_diffs <- as.numeric(dates[i] - prior_dates)
-        weights <- exp(-lambda * time_diffs)
-        
-        result[i] <- sum(prior_vals * weights) / sum(weights)
-      }
-    }
-  }
-  return(result)
-}
-
-create_all_windows <- function(df, climate_var_base = "overall_final_score", min_n = 1) {
-  
-  # Ensure temporal variables exist
-  df <- df %>%
-    mutate(
-      year = lubridate::year(event_date),
-      month = lubridate::month(event_date),
-      yearmonth_num = (year - min(year)) * 12 + month,
-      yearmonth_num_c = as.vector(scale(yearmonth_num, center = TRUE, scale = TRUE)),
-      sin_month = sin(2 * pi * month / 12),
-      cos_month = cos(2 * pi * month / 12)
-    ) %>%
-    arrange(org_id, event_date) %>%
-    group_by(org_id)
-  
-  # Add SMA windows
-  for (win in WINDOW_SPECS$sma$window_size) {
-    var_name <- glue("{climate_var_base}_sma_{win}")
-    
-    df <- df %>%
-      mutate(
-        !!var_name := slider::slide_dbl(
-          lag(.data[[climate_var_base]], 1),
-          ~ mean(.x, na.rm = TRUE),
-          .before = win - 1,
-          .complete = TRUE
-        )
-      )
-  }
-  
-  df <- df %>% ungroup()
-  
-  # Add EWMA windows
-  for (i in 1:nrow(WINDOW_SPECS$ewma)) {
-    lag_d <- WINDOW_SPECS$ewma$lag_days[i]
-    hl_d <- WINDOW_SPECS$ewma$halflife_days[i]
-    var_name <- glue("{climate_var_base}_ewmaLAG_{lag_d}d_hl{hl_d}d")
-    
-    df <- df %>%
-      arrange(org_id, event_date) %>%
-      group_by(org_id) %>%
-      mutate(
-        !!var_name := ewma_time_decay_irregular_lag(
-          .data[[climate_var_base]], event_date, lag_d, hl_d, min_n
-        )
-      ) %>%
-      ungroup()
-  }
-  
-  return(df)
-}
 
 # ==============================================================================
 # MODEL FITTING FUNCTION
@@ -482,30 +42,13 @@ create_all_windows <- function(df, climate_var_base = "overall_final_score", min
 #' @param outcome Outcome variable ("injuries", "fatalities", or "costs")
 fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injuries") {
   
-  # Get outcome variable name
-  outcome_var <- case_when(
-    outcome == "injuries" ~ "total_persons_injured",
-    outcome == "fatalities" ~ "total_persons_killed",
-    outcome == "costs" ~ "total_damage_cost"
-  )
+  outcome_var <- get_outcome_var(outcome)
   
   # Operational variable names
   ops_between_vars <- paste0(OPS_VARS, "_between")
   ops_within_vars <- paste0(OPS_VARS, "_within")
   all_ops_vars <- c(ops_between_vars, ops_within_vars)
   
-  # Add this BEFORE the filter to debug
-  cat("=== DIAGNOSTIC ===\n")
-  cat("OPS_VARS:", paste(OPS_VARS, collapse = ", "), "\n")
-  cat("all_ops_vars:", paste(all_ops_vars, collapse = ", "), "\n")
-  cat("\nColumns in data containing 'train':\n")
-  print(grep("train", names(data), value = TRUE))
-  cat("\nColumns in data containing 'between' or 'within':\n")
-  print(grep("between|within", names(data), value = TRUE))
-  cat("\nMissing ops vars:\n")
-  print(setdiff(all_ops_vars, names(data)))
-  cat("=================\n")
-
   # Filter to complete cases (including operational variables)
   complete_data <- tryCatch({
     data %>%
@@ -518,16 +61,6 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
         !is.na(org_id),
         if_all(all_of(all_ops_vars), ~ !is.na(.x))
       )
-      # filter(
-      #   !is.na(.data[[climate_var]]),
-      #   !is.na(.data[[outcome_var]]),
-      #   !is.na(yearmonth_num_c),
-      #   !is.na(sin_month),
-      #   !is.na(cos_month),
-      #   !is.na(org_id),
-      #   # Operational variables - check all exist and are non-NA
-      #   across(all_of(all_ops_vars), ~ !is.na(.x))
-      # )
   }, error = function(e) {
     return(list(
       config_id = config_id,
@@ -607,6 +140,12 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
     cond_formula_str <- gsub("CLIMATE_VAR", climate_var, formulas$conditional)
     zi_formula_str <- gsub("CLIMATE_VAR", climate_var, formulas$zero_inflation)
     
+    # Helper function to safely extract coefficient info
+    safe_extract <- function(df, term_name, col) {
+      row <- df %>% filter(term == term_name)
+      if (nrow(row) > 0) row[[col]][1] else NA_real_
+    }
+    
     # Fit hurdle model based on outcome
     if (outcome == "costs") {
       # For costs: Filter to positive values for Gamma model
@@ -663,26 +202,16 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
       })
     }
     
-    # Helper function to safely extract coefficient info
-    safe_extract <- function(df, term_name, col) {
-      row <- df %>% filter(term == term_name)
-      if (nrow(row) > 0) row[[col]][1] else NA_real_
-    }
-    
     # Extract fixed effects based on model type
     if (outcome == "costs" && is.list(fit) && !is.null(fit$type)) {
       # Hurdle gamma model: extract from both parts
-      
-      # Binary part (whether damage occurs)
       fixed_eff_binary <- tidy(fit$binary, effects = "fixed", conf.int = TRUE)
-      # Gamma part (damage amount given damage)
       fixed_eff_gamma <- tidy(fit$gamma, effects = "fixed", conf.int = TRUE)
       
-      # Climate effects
       climate_row_zi <- fixed_eff_binary %>% filter(term == climate_var)
       climate_row_cond <- fixed_eff_gamma %>% filter(term == climate_var)
       
-      # Operational effects - Conditional (Gamma)
+      # Operational effects
       ops_effects_cond <- map_dfr(c(ops_between_vars, ops_within_vars), function(v) {
         tibble(
           term = v,
@@ -694,7 +223,6 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
         )
       })
       
-      # Operational effects - ZI (Binary)
       ops_effects_zi <- map_dfr(c(ops_between_vars, ops_within_vars), function(v) {
         tibble(
           term = v,
@@ -729,14 +257,12 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
       
     } else {
       # Count models: extract from single hurdle model
-      
       fixed_eff_cond <- tidy(fit, effects = "fixed", component = "cond", conf.int = TRUE)
       fixed_eff_zi <- tidy(fit, effects = "fixed", component = "zi", conf.int = TRUE)
       
       climate_row_cond <- fixed_eff_cond %>% filter(term == climate_var)
       climate_row_zi <- fixed_eff_zi %>% filter(term == climate_var)
       
-      # Operational effects - Conditional
       ops_effects_cond <- map_dfr(c(ops_between_vars, ops_within_vars), function(v) {
         tibble(
           term = v,
@@ -748,7 +274,6 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
         )
       })
       
-      # Operational effects - ZI
       ops_effects_zi <- map_dfr(c(ops_between_vars, ops_within_vars), function(v) {
         tibble(
           term = v,
@@ -760,14 +285,12 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
         )
       })
       
-      # Extract random effects
       random_eff <- tidy(fit, effects = "ran_pars")
       re_intercept_cond <- random_eff %>% 
         filter(term == "sd__(Intercept)", component == "cond")
       re_intercept_zi <- random_eff %>% 
         filter(term == "sd__(Intercept)", component == "zi")
       
-      # Model fit statistics
       fit_stats <- tibble(
         AIC = AIC(fit),
         BIC = BIC(fit),
@@ -846,18 +369,23 @@ fit_single_rail_model <- function(data, climate_var, config_id, outcome = "injur
       outcome = outcome,
       status = "failed",
       error = as.character(e$message),
-      n_obs = if(exists("complete_data")) nrow(complete_data) else NA_integer_
+      n_obs = if (exists("complete_data")) nrow(complete_data) else NA_integer_
     )
   })
   
   return(result)
 }
 
+
 # ==============================================================================
 # MAIN ANALYSIS FUNCTION FOR SINGLE CONFIGURATION
 # ==============================================================================
 
 #' Run all window analyses for a single configuration
+#' 
+#' Uses prepare_config_data() from common/data_prep.R for data preparation,
+#' then fits hurdle models for each windowed climate variable.
+#' 
 #' @param parquet_path Path to parquet file
 #' @param config_id Configuration ID
 #' @param rail_raw Raw rail data for joining (event-level, irregular time series)
@@ -870,56 +398,13 @@ analyze_single_config_rail <- function(parquet_path, config_id, rail_raw,
                                        outcome = "injuries",
                                        min_reports = 50, min_n = 1) {
   
-  # Load and prepare data
- df <- arrow::read_parquet(parquet_path) %>%
-    select(
-      ends_with('_id'),
-      starts_with('overall_'),
-      ends_with('_domain_score')
-    ) %>%
-    rename(eid = report_id) %>%
-    left_join(rail_raw, by = 'eid') %>%
-    filter(!is.na(event_date)) %>%
-    group_by(org_id) %>%
-    filter(n() > min_reports) %>%
-    arrange(event_date) %>%
-    mutate(t = row_number()) %>%
-    ungroup()
-  
-  df$config_id <- config_id
-  df$source_file <- normalizePath(parquet_path)
-  
-  # Create all windowed climate variables
-  df <- create_all_windows(df, climate_var_base = "overall_final_score", min_n = min_n)
-  
-  # Create yearmonth for joining with operational data
-  df <- df %>%
-    mutate(yearmonth = as.Date(lubridate::floor_date(event_date, "month")))
-  
-  # Join operational features if provided
-  if (!is.null(ops_features)) {
-    df <- df %>%
-      left_join(ops_features, by = c("org_id", "yearmonth"))
-    
-    # Report join success
-    ops_cols <- paste0(OPS_VARS[1], "_between")
-    n_with_ops <- sum(!is.na(df[[ops_cols]]))
-    cat(sprintf("  Config %s: %d/%d events matched to operational data (%.1f%%)\n",
-                config_id, n_with_ops, nrow(df), 100*n_with_ops/nrow(df)))
-  } else {
-    # Create placeholder columns with NA if no operational data
-    for (v in OPS_VARS) {
-      df[[paste0(v, "_between")]] <- NA_real_
-      df[[paste0(v, "_within")]] <- NA_real_
-    }
-  }
-  
+  # Prepare data using shared function
+  df <- prepare_config_data(parquet_path, config_id, rail_raw,
+                            ops_features = ops_features,
+                            min_reports = min_reports, min_n = min_n)
   
   # Get all climate variable names
-  climate_vars <- c(
-    names(df) %>% str_subset("overall_final_score_sma_"),
-    names(df) %>% str_subset("overall_final_score_ewmaLAG_")
-  )
+  climate_vars <- get_climate_vars(df)
   
   # Fit models for each window
   results_list <- map(climate_vars, function(cvar) {
@@ -928,6 +413,7 @@ analyze_single_config_rail <- function(parquet_path, config_id, rail_raw,
   
   return(results_list)
 }
+
 
 # ==============================================================================
 # BATCH PROCESSING FUNCTION
@@ -943,13 +429,13 @@ analyze_single_config_rail <- function(parquet_path, config_id, rail_raw,
 #' @param save_models Whether to save full model objects
 #' @param output_dir Directory for saving results
 run_rail_multiverse <- function(cfg_dir, 
-                                 rail_raw,
-                                 ops_path = NULL,
-                                 outcome = "injuries",
-                                 config_ids = NULL,
-                                 n_cores = 16,
-                                 save_models = TRUE,
-                                 output_dir = "results") {
+                                rail_raw,
+                                ops_path = NULL,
+                                outcome = "injuries",
+                                config_ids = NULL,
+                                n_cores = 16,
+                                save_models = TRUE,
+                                output_dir = "results") {
   
   cat("========================================\n")
   cat(sprintf("RAIL MULTIVERSE ANALYSIS (glmmTMB) - %s\n", toupper(outcome)))
@@ -967,14 +453,7 @@ run_rail_multiverse <- function(cfg_dir,
     cat("Loading and preparing operational data...\n")
     ops_features <- load_and_prepare_ops_features(
       ops_path,
-      date_var = "yearmonth",
-      org_var = "org_id",
-      vars = OPS_VARS,
-      lag_k = OPS_LAG_K,
-      roll_k = OPS_ROLL_K,
-      min_hist = OPS_MIN_HIST,
-      log1p_transform = TRUE,
-      standardize = TRUE
+      ops_vars = OPS_VARS
     )
     cat(sprintf("Operational features ready: %d org-months\n\n", nrow(ops_features)))
   } else {
@@ -993,19 +472,15 @@ run_rail_multiverse <- function(cfg_dir,
   }
   
   # Reduce rail_raw to only necessary columns (event-level data)
-  outcome_var <- case_when(
-    outcome == "injuries" ~ "total_persons_injured",
-    outcome == "fatalities" ~ "total_persons_killed",
-    outcome == "costs" ~ "total_damage_cost"
-  )
+  outcome_var <- get_outcome_var(outcome)
   
   rail_raw_minimal <- rail_raw %>%
     select(eid, org_id, event_date, all_of(outcome_var)) %>%
     distinct()
   
   cat(sprintf("Reduced rail_raw from %.1f MB to %.1f MB\n",
-              object.size(rail_raw)/1e6,
-              object.size(rail_raw_minimal)/1e6))
+              object.size(rail_raw) / 1e6,
+              object.size(rail_raw_minimal) / 1e6))
   
   n_configs <- length(config_ids)
   n_windows <- nrow(WINDOW_SPECS$sma) + nrow(WINDOW_SPECS$ewma)
@@ -1070,7 +545,11 @@ run_rail_multiverse <- function(cfg_dir,
         OPS_LAG_K = OPS_LAG_K,
         OPS_ROLL_K = OPS_ROLL_K,
         OPS_MIN_HIST = OPS_MIN_HIST,
+        OUTCOME_VARS = OUTCOME_VARS,
+        get_outcome_var = get_outcome_var,
         analyze_single_config_rail = analyze_single_config_rail,
+        prepare_config_data = prepare_config_data,
+        get_climate_vars = get_climate_vars,
         create_all_windows = create_all_windows,
         ewma_time_decay_irregular_lag = ewma_time_decay_irregular_lag,
         fit_single_rail_model = fit_single_rail_model
@@ -1092,10 +571,10 @@ run_rail_multiverse <- function(cfg_dir,
   cat(sprintf("Results Summary:\n"))
   cat(sprintf("  Successful: %d (%.1f%%)\n", 
               length(successful), 
-              100*length(successful)/length(all_results_flat)))
+              100 * length(successful) / length(all_results_flat)))
   cat(sprintf("  Failed: %d (%.1f%%)\n\n",
               length(failed),
-              100*length(failed)/length(all_results_flat)))
+              100 * length(failed) / length(all_results_flat)))
   
   # Save failed results
   if (length(failed) > 0) {
@@ -1132,34 +611,29 @@ run_rail_multiverse <- function(cfg_dir,
     ))
   }
   
-  # Extract results table - now with operational effects
+  # Extract results table
   results_table <- map_dfr(successful, function(r) {
-    # Base tibble with core results
     base_result <- tibble(
       config_id = r$config_id,
       climate_var = r$climate_var,
       outcome = r$outcome,
       status = r$status,
       
-      # Climate effects - Conditional
       climate_estimate_cond = r$climate_estimate_cond,
       climate_se_cond = r$climate_se_cond,
       climate_pval_cond = r$climate_pval_cond,
       climate_conf_low_cond = r$climate_conf_low_cond,
       climate_conf_high_cond = r$climate_conf_high_cond,
       
-      # Climate effects - ZI
       climate_estimate_zi = r$climate_estimate_zi,
       climate_se_zi = r$climate_se_zi,
       climate_pval_zi = r$climate_pval_zi,
       climate_conf_low_zi = r$climate_conf_low_zi,
       climate_conf_high_zi = r$climate_conf_high_zi,
       
-      # Random effects
       random_intercept_sd_cond = r$random_intercept_sd_cond,
       random_intercept_sd_zi = r$random_intercept_sd_zi,
       
-      # Fit stats
       AIC = r$AIC,
       BIC = r$BIC,
       logLik = r$logLik,
@@ -1175,13 +649,11 @@ run_rail_multiverse <- function(cfg_dir,
     ops_within_vars <- paste0(OPS_VARS, "_within")
     
     for (v in c(ops_between_vars, ops_within_vars)) {
-      # Conditional
       base_result[[paste0(v, "_estimate_cond")]] <- r[[paste0(v, "_estimate_cond")]] %||% NA_real_
       base_result[[paste0(v, "_se_cond")]] <- r[[paste0(v, "_se_cond")]] %||% NA_real_
       base_result[[paste0(v, "_pval_cond")]] <- r[[paste0(v, "_pval_cond")]] %||% NA_real_
       base_result[[paste0(v, "_conf_low_cond")]] <- r[[paste0(v, "_conf_low_cond")]] %||% NA_real_
       base_result[[paste0(v, "_conf_high_cond")]] <- r[[paste0(v, "_conf_high_cond")]] %||% NA_real_
-      # ZI
       base_result[[paste0(v, "_estimate_zi")]] <- r[[paste0(v, "_estimate_zi")]] %||% NA_real_
       base_result[[paste0(v, "_se_zi")]] <- r[[paste0(v, "_se_zi")]] %||% NA_real_
       base_result[[paste0(v, "_pval_zi")]] <- r[[paste0(v, "_pval_zi")]] %||% NA_real_

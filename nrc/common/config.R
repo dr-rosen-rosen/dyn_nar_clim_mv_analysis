@@ -9,21 +9,21 @@
 # ==============================================================================
 
 WINDOW_SPECS <- list(
-  sma = tibble::tibble(window_size = c(3, 5, 10, 20)),
+  sma = tibble::tibble(window_size = c(3, 10, 20)),
   ewma = tibble::tribble(
     ~lag_days, ~halflife_days,
-    180,  60,
+    #180,  60,
     180,  90,
-    360,  90,
+    #360,  90,
     360,  180,
-    540,  180,
-    540,  270,
-    720,  180,
-    720,  360,
-    900,  270,
-    900,  450,
-    1080, 360,
-    1080, 540
+    #540,  180,
+    #540,  270,
+    #720,  180,
+    720,  360#,
+    #900,  270,
+    #900,  450,
+    #1080, 360,
+    #1080, 540
   )
 )
 
@@ -34,7 +34,10 @@ WINDOW_SPECS <- list(
 # These are the between/within decomposed covariates from nrc_operational_data.py
 # Available after processing: action_matrix_col, findings_count, findings_nongreen_count
 # Phase 2 (power status): capacity_factor, power_std, n_shutdowns
-NRC_OPS_VARS <- c("action_matrix_col", "findings_count")
+NRC_OPS_VARS <- c(
+  "capacity_factor", "power_std"
+  #"action_matrix_col", "findings_count"
+  )
 
 # Rolling window parameters for between/within decomposition
 # (already computed in Python — these are for documentation/reference)
@@ -93,31 +96,43 @@ get_outcome_config <- function(outcome) {
 # facility is the random effect grouping variable.
 
 # Base formula components
-.temporal_controls <- "factor(year)"
+# Binary models (glmer) can handle year fixed effects — enough events per cell
+# .temporal_controls_binary <- "factor(year)"
+# Both binary and ordinal use the same smooth temporal controls
+.temporal_controls_binary <- "yearmonth_num_c + sin_month + cos_month"
+
+# Ordinal models (clmm) use numeric trend + sin/cos seasonality to avoid
+# complete separation in years with zero events in one ordinal category.
+# Year FE with 25+ levels causes singular Hessian when any year has 0 scrams
+# in a category (years 2003, 2005, 2011, 2012, 2023 showed this).
+.temporal_controls_ordinal <- "yearmonth_num_c + sin_month + cos_month"
+
 .ops_covariates <- paste0(
-  "action_matrix_col_between + action_matrix_col_within + ",
-  "findings_count_between + findings_count_within"
+  #"action_matrix_col_between + action_matrix_col_within + ",
+  #"findings_count_between + findings_count_within"
+  #"action_matrix_col_between + action_matrix_col_within"
+  "capacity_factor_between + capacity_factor_within + ",
+  "power_std_between + power_std_within"
 )
 
 MODEL_FORMULAS <- list(
   # Binary scram: glmer(binomial)
   binary_scram = paste0(
-    "scram_binary ~ ", .temporal_controls, " + ",
+    "scram_binary ~ ", .temporal_controls_binary, " + ",
     .ops_covariates, " + ",
     "CLIMATE_VAR + (1 | facility)"
   ),
 
-  # Ordinal scram: clmm — note: no explicit LHS for clmm, it's set separately
-  # clmm formula: scram_ord_factor ~ fixed_effects + (1 | facility)
+  # Ordinal scram: clmm — numeric trend avoids year-level separation
   ordinal_scram = paste0(
-    "scram_ord_factor ~ ", .temporal_controls, " + ",
+    "scram_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates, " + ",
     "CLIMATE_VAR"
   ),
 
   # Emergency class: clmm
   emerg_class = paste0(
-    "emerg_class_ord_factor ~ ", .temporal_controls, " + ",
+    "emerg_class_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates, " + ",
     "CLIMATE_VAR"
   )
@@ -126,15 +141,15 @@ MODEL_FORMULAS <- list(
 # Formula without climate variable (for baseline comparisons in CV)
 MODEL_FORMULAS_NO_CLIMATE <- list(
   binary_scram = paste0(
-    "scram_binary ~ ", .temporal_controls, " + ",
+    "scram_binary ~ ", .temporal_controls_binary, " + ",
     .ops_covariates, " + (1 | facility)"
   ),
   ordinal_scram = paste0(
-    "scram_ord_factor ~ ", .temporal_controls, " + ",
+    "scram_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates
   ),
   emerg_class = paste0(
-    "emerg_class_ord_factor ~ ", .temporal_controls, " + ",
+    "emerg_class_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates
   )
 )
@@ -147,7 +162,7 @@ MODEL_FORMULAS_INTERCEPT <- list(
 # Seasonal-only formula (temporal controls + ops, no climate — for CV)
 MODEL_FORMULAS_SEASONAL <- list(
   binary_scram = paste0(
-    "scram_binary ~ ", .temporal_controls, " + ",
+    "scram_binary ~ ", .temporal_controls_binary, " + ",
     .ops_covariates, " + (1 | facility)"
   )
 )

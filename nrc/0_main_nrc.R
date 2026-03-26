@@ -13,7 +13,8 @@ nrc_events <- arrow::read_parquet(
   here::here(cfg_dir,"events.parquet")
 ) %>%
   mutate(event_date = as.Date(event_date))
-ops_dir <- "/Users/mrosen44/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/data/processed/nrc"
+#ops_dir <- "/Users/mrosen44/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/data/processed/nrc"
+ops_dir <- here::here(cfg_dir,"data/processed/nrc")
 # # Load operational features (from nrc_operational_data.py output)
 
 ops_features <- arrow::read_parquet(
@@ -34,21 +35,19 @@ skimr::skim(ops_features)
 
 # ==============================================================================
 # Multiverse analysis for NRC
-# ==============================================================================
+# ============================================================================
 source("1_nrc_multiverse.R")
-# # Run multiverse
-tictoc::tic()
 results <- run_nrc_multiverse(
-  cfg_dir      = cfg_dir,#here::here(cfg_dir,"_cfg"),
+  cfg_dir      = cfg_dir,
   nrc_events   = nrc_events,
   ops_features = ops_features,
+  config_ids = c(1,2,3,4,5,6,7,8,500,203,57),
   outcomes     = c("binary_scram", "ordinal_scram", "emerg_class"),
-  n_workers    = 8L,
-  output_path  = "results/nrc/nrc_multiverse_results.parquet"
+  n_workers    = 22L,
+  output_path  = "results/nrc/nrc_multiverse_results.parquet",
+  min_reports = 75
 )
-tictoc::toc()
 t <- arrow::read_parquet("results/nrc/nrc_multiverse_results.parquet")
-
 # ==============================================================================
 # Multiverse CV analysis for NRC
 # ==============================================================================
@@ -58,7 +57,7 @@ cv_results <- run_nrc_cv(
   cfg_dir      = cfg_dir,
   nrc_events   = nrc_events,
   ops_features = ops_features,
-  n_workers    = 8L,
+  n_workers    = 22L,
   K            = 5,
   output_path  = "results/nrc/nrc_cv_results.parquet"
 )
@@ -72,3 +71,23 @@ generate_nrc_plots(
   # cv_results_path = "results/nrc/nrc_cv_results.parquet",
   output_dir      = "results/nrc/plots"
 )
+
+source("postprocessing.R")
+
+results <- arrow::read_parquet("results/nrc/nrc_multiverse_results.parquet")
+results_full <- link_results_to_config(results, here::here(cfg_dir,"config_registry.csv"))
+
+# Spec curve with panels
+plot_spec_curve_with_panels(results_full, outcome_filter = "ordinal_scram",#"emerg_class",
+                            decision_vars = c("window_type", "embedding_model", 
+                                              "sent_method", "comp__method",
+                                              "lag_days", "halflife_days"))
+
+# Config importance
+analyze_config_importance(results_full, outcome_filter = "ordinal_scram")
+
+# Ops effects
+compare_climate_vs_operational(results_full, outcome_filter = "ordinal_scram")
+
+
+

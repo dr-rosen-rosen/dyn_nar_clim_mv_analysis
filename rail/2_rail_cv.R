@@ -17,7 +17,7 @@ library(here)
 library(slider)
 
 # Source shared modules
-common_dir <- file.path(here::here(), "common")
+common_dir <- file.path(here::here(), "rail/common")
 if (!dir.exists(common_dir)) common_dir <- "common"
 source(file.path(common_dir, "config.R"))
 source(file.path(common_dir, "data_prep.R"))

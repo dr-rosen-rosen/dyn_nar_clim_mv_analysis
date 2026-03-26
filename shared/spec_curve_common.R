@@ -856,10 +856,13 @@ generate_mv_spec_curves <- function(results_with_config,
 
   cat("Done.\n")
 }
+
+outcome <- 'injuries'
 source("3_rail_multiverse_postprocessing_w_ops.R")
 # Link to config data
 mv_results_rail <- link_results_to_config_railway(
-  arrow::read_parquet(glue::glue("results/cv/{outcome}/rail_{outcome}_cv_results.parquet")),,
+  # arrow::read_parquet(glue::glue("results/cv/{outcome}/rail_{outcome}_cv_results.parquet")),
+  arrow::read_parquet(glue::glue("results/cv/{outcome}/rail_{outcome}_multiverse_results.parquet")),
   config_registry_path = here::here(cfg_dir,'config_registry.csv')
 ) |>
   mutate(
@@ -869,3 +872,9 @@ mv_results_rail <- link_results_to_config_railway(
 res <- plot_spec_curve_brier(cv_results = mv_results_rail,
                              strategy = 'timeseries')
 res$plot
+
+res_mv <- plot_spec_curve_estimate(
+  results_with_config = mv_results_rail,
+                                            outcome_filter = outcome,
+                                     component      = "zi")
+res_mv$plot
