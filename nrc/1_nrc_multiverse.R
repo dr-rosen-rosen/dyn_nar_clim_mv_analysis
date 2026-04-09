@@ -11,6 +11,7 @@ library(tidyverse)
 library(lme4)        # glmer for binary
 library(ordinal)     # clmm for ordinal
 library(broom.mixed) # tidy extraction
+library(glmmTMB)     # hurdle models for power loss
 library(arrow)
 library(furrr)
 library(glue)
@@ -18,7 +19,7 @@ library(here)
 library(slider)
 
 # Source shared modules
-common_dir <- file.path(here::here(), "common")
+common_dir <- file.path(here::here(), "nrc/common")
 if (!dir.exists(common_dir)) common_dir <- "common"
 source(file.path(common_dir, "config.R"))
 source(file.path(common_dir, "data_prep.R"))
@@ -330,7 +331,145 @@ fit_ordinal_model <- function(data, climate_var, config_id, outcome = "ordinal_s
   })
 }
 
+# ==============================================================================
+# MODEL FITTING: POWER LOSS SEVERITY (glmmTMB hurdle)
+# ==============================================================================
 
+#' Fit a hurdle model for power loss percentage (glmmTMB)
+#'
+#' Two-part model:
+#'   ZI component:  P(power_loss = 0) — does any power loss occur?
+#'   Cond component: E(power_loss | power_loss > 0) — how severe?
+#'
+#' @param data Prepared data frame
+#' @param climate_var Name of the windowed climate variable
+#' @param config_id Configuration ID
+#' @return Tibble row with model results (both cond and zi estimates)
+fit_power_loss_hurdle <- function(data, climate_var, config_id) {
+  fmls <- build_formula(MODEL_FORMULAS[["power_loss_pct"]], climate_var)
+  
+  # Filter to events with valid power loss data
+  complete_data <- data %>%
+    filter(
+      !is.na(power_loss_pct),
+      !is.na(.data[[climate_var]]),
+      !is.na(capacity_factor_between),
+      !is.na(yearmonth_num_c)
+    )
+  
+  n_obs <- nrow(complete_data)
+  n_pos <- sum(complete_data$power_loss_pct > 0)
+  
+  if (n_pos < 50) {
+    return(tibble(
+      config_id = config_id, climate_var = climate_var,
+      outcome = "power_loss_pct", status = "failed",
+      error = sprintf("Insufficient positive power loss: %d", n_pos),
+      n_obs = n_obs
+    ))
+  }
+  
+  positive_data <- complete_data %>% filter(power_loss_pct > 0)
+  
+  fit_binary <- tryCatch(
+    suppressWarnings({
+      glmmTMB(
+        as.formula(fmls$binary),
+        data = complete_data,
+        family = binomial(link = "logit")
+      )
+    }),
+    error = function(e) { cat("BINARY ERROR:", e$message, "\n"); NULL }
+  )
+  
+  fit_gamma <- tryCatch(
+    suppressWarnings({
+      glmmTMB(
+        as.formula(fmls$gamma),
+        data = positive_data,
+        family = Gamma(link = "log")
+      )
+    }),
+    error = function(e) { cat("GAMMA ERROR:", e$message, "\n"); NULL }
+  )
+  
+  if (is.null(fit_binary) || is.null(fit_gamma)) {
+    return(tibble(
+      config_id = config_id, climate_var = climate_var,
+      outcome = "power_loss_pct", status = "failed",
+      error = "Model fitting failed",
+      n_obs = n_obs
+    ))
+  }
+  
+  # Extract coefficients
+  fixed_binary <- broom.mixed::tidy(fit_binary, effects = "fixed", conf.int = TRUE)
+  fixed_gamma  <- broom.mixed::tidy(fit_gamma,  effects = "fixed", conf.int = TRUE)
+  
+  safe_extract <- function(df, term_name, col) {
+    row <- df %>% filter(term == term_name)
+    if (nrow(row) > 0) row[[col]][1] else NA_real_
+  }
+  
+  # Convergence check
+  conv_binary <- is.null(fit_binary$fit$convergence) || fit_binary$fit$convergence == 0
+  conv_gamma  <- is.null(fit_gamma$fit$convergence)  || fit_gamma$fit$convergence == 0
+  status <- if (conv_binary && conv_gamma) "success" else "convergence_warning"
+  
+  # Extract ops covariate effects from binary part (ZI equivalent)
+  ops_between_vars <- paste0(NRC_OPS_VARS, "_between")
+  ops_within_vars  <- paste0(NRC_OPS_VARS, "_within")
+  all_ops_vars     <- c(ops_between_vars, ops_within_vars)
+  
+  ops_results <- list()
+  for (v in all_ops_vars) {
+    ops_results[[paste0(v, "_estimate")]] <- safe_extract(fixed_binary, v, "estimate")
+    ops_results[[paste0(v, "_p")]]        <- safe_extract(fixed_binary, v, "p.value")
+  }
+  
+  tibble(
+    config_id           = config_id,
+    climate_var         = climate_var,
+    outcome             = "power_loss_pct",
+    status              = status,
+    n_obs               = n_obs,
+    n_positive          = n_pos,
+    # Climate - binary part (ZI)
+    climate_estimate_zi   = safe_extract(fixed_binary, climate_var, "estimate"),
+    climate_se_zi         = safe_extract(fixed_binary, climate_var, "std.error"),
+    climate_pval_zi       = safe_extract(fixed_binary, climate_var, "p.value"),
+    climate_ci_low_zi     = safe_extract(fixed_binary, climate_var, "conf.low"),
+    climate_ci_high_zi    = safe_extract(fixed_binary, climate_var, "conf.high"),
+    # Climate - gamma part (conditional)
+    climate_estimate_cond = safe_extract(fixed_gamma, climate_var, "estimate"),
+    climate_se_cond       = safe_extract(fixed_gamma, climate_var, "std.error"),
+    climate_pval_cond     = safe_extract(fixed_gamma, climate_var, "p.value"),
+    climate_ci_low_cond   = safe_extract(fixed_gamma, climate_var, "conf.low"),
+    climate_ci_high_cond  = safe_extract(fixed_gamma, climate_var, "conf.high"),
+    # Ops covariates (from binary part)
+    !!!ops_results,
+    # Model fit
+    aic_binary = AIC(fit_binary),
+    aic_gamma  = AIC(fit_gamma)
+  )
+}
+# wrappers
+
+fit_binary_power_loss <- function(data, climate_var, config_id) {
+  # Reuse binary scram logic with different outcome variable
+  data <- data %>% mutate(.outcome = power_loss_binary)
+  result <- fit_binary_scram(data %>% mutate(scram_binary = power_loss_binary),
+                             climate_var, config_id)
+  result$outcome <- "power_loss_binary"
+  return(result)
+}
+
+fit_binary_emerg <- function(data, climate_var, config_id) {
+  data <- data %>% mutate(scram_binary = emerg_binary)
+  result <- fit_binary_scram(data, climate_var, config_id)
+  result$outcome <- "emerg_binary"
+  return(result)
+}
 # ==============================================================================
 # ANALYZE SINGLE CONFIGURATION (all outcomes × all windows)
 # ==============================================================================
@@ -393,6 +532,21 @@ analyze_single_config_nrc <- function(parquet_path, config_id, nrc_events,
     if ("emerg_class" %in% outcomes) {
       results_list <- c(results_list, list(
         fit_ordinal_model(df, cvar, config_id, "emerg_class")
+      ))
+    }
+    if ("power_loss_pct" %in% outcomes) {
+      results_list <- c(results_list, list(
+        fit_power_loss_hurdle(df, cvar, config_id)
+      ))
+    }
+    if ("power_loss_binary" %in% outcomes) {
+      results_list <- c(results_list, list(
+        fit_binary_power_loss(df, cvar, config_id)
+      ))
+    }
+    if ("emerg_binary" %in% outcomes) {
+      results_list <- c(results_list, list(
+        fit_binary_emerg(df, cvar, config_id)
       ))
     }
   }
@@ -486,7 +640,7 @@ run_nrc_multiverse <- function(cfg_dir,
   }, .options = furrr_options(
     seed = TRUE,
     packages = c("tidyverse", "lme4", "ordinal", "broom.mixed",
-                 "arrow", "glue", "slider"),
+                 "arrow", "glue", "slider", "glmmTMB"),
     globals = list(
       cfg_dir = cfg_dir,
       nrc_events = nrc_events,
@@ -507,6 +661,9 @@ run_nrc_multiverse <- function(cfg_dir,
       join_nrc_ops = join_nrc_ops,
       fit_binary_scram = fit_binary_scram,
       fit_ordinal_model = fit_ordinal_model,
+      fit_power_loss_hurdle = fit_power_loss_hurdle,
+      fit_binary_power_loss = fit_binary_power_loss,
+      fit_binary_emerg = fit_binary_emerg,
       get_climate_vars = get_climate_vars,
       get_outcome_config = get_outcome_config,
       build_formula = build_formula

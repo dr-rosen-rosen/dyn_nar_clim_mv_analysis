@@ -1,0 +1,140 @@
+---
+title: "dynclim — Specification Curves"
+subtitle: "Multiverse & Cross-Validation Results by Industry and Outcome"
+date: today
+date-format: "MMMM D, YYYY"
+author: "Mike"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    number-sections: true
+    code-fold: true
+    code-summary: "Show code"
+    self-contained: true        # single portable file
+    fig-align: center
+    fig-width: 10
+    fig-height: 6
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+# ============================================================
+# CONFIGURATION — edit this block to match your file paths
+# ============================================================
+
+# Root directories for each industry's plot output
+PLOT_DIRS <- list(
+  rail = "rail_analysis/plots",
+  nrc  = "nrc_analysis/plots"
+)
+
+# Outcomes for each industry.
+# Each entry: list(id = "used_in_filename", label = "Human-readable label")
+OUTCOMES <- list(
+  rail = list(
+    list(id = "hurdle_count",    label = "Event Count (Hurdle)"),
+    list(id = "hurdle_severity", label = "Severity (Hurdle)")
+  ),
+  nrc = list(
+    list(id = "ordinal_scram",   label = "Reactor Scram (Ordinal)"),
+    list(id = "count_ler",       label = "LER Event Count")
+  )
+)
+
+# Plot filename templates.
+# Use {outcome} as the placeholder — it will be replaced with the outcome id.
+# Adjust these to match what your R scripts actually save.
+PLOT_TEMPLATES <- list(
+  multiverse = "spec_curve_multiverse_{outcome}.png",
+  cv         = "spec_curve_cv_{outcome}.png"
+)
+
+# ============================================================
+# Helper functions — no need to edit below this line
+# ============================================================
+
+library(knitr)
+library(glue)
+
+plot_path <- function(industry, type, outcome_id) {
+  dir      <- PLOT_DIRS[[industry]]
+  template <- PLOT_TEMPLATES[[type]]
+  fname    <- glue(template, outcome = outcome_id)
+  file.path(dir, fname)
+}
+
+# Returns TRUE if file exists and is non-empty
+plot_exists <- function(path) file.exists(path) && file.size(path) > 0
+
+# Render one outcome section: multiverse + CV side by side
+# Called inside a ::: panel-tabset block for each industry
+render_outcome_section <- function(industry, outcome) {
+  id    <- outcome$id
+  label <- outcome$label
+
+  mv_path <- plot_path(industry, "multiverse", id)
+  cv_path <- plot_path(industry, "cv", id)
+
+  cat(glue("\n\n### {label}\n\n"))
+  cat("::: {.columns}\n\n")
+
+  # Left column: multiverse
+  cat("::: {.column width='50%'}\n")
+  cat("**Multiverse Specification Curve**\n\n")
+  if (plot_exists(mv_path)) {
+    cat(glue("![]({mv_path}){{fig-alt='Multiverse spec curve for {label}' width=100%}}\n\n"))
+  } else {
+    cat(glue("> ⚠️ Plot not found: `{mv_path}`\n\n"))
+  }
+  cat(":::\n\n")
+
+  # Right column: CV
+  cat("::: {.column width='50%'}\n")
+  cat("**Cross-Validation Specification Curve**\n\n")
+  if (plot_exists(cv_path)) {
+    cat(glue("![]({cv_path}){{fig-alt='CV spec curve for {label}' width=100%}}\n\n"))
+  } else {
+    cat(glue("> ⚠️ Plot not found: `{cv_path}`\n\n"))
+  }
+  cat(":::\n\n")
+
+  cat(":::\n\n")
+  cat("---\n\n")
+}
+```
+
+## Overview {.unnumbered}
+
+This document collects specification curves from the dynclim multiverse analysis across
+all industries and outcomes. Each section contains the **multiverse** curve (all analytical
+specifications ranked by effect size) alongside the **cross-validation** curve (same
+specifications ranked by held-out Brier score) for direct comparison.
+
+::: {.callout-note}
+Plots are sourced directly from the R analysis output directories. Re-render this document
+after any analysis run to update all figures automatically.
+:::
+
+## Rail {.tabset}
+
+```{r rail-sections, results='asis'}
+for (outcome in OUTCOMES$rail) {
+  render_outcome_section("rail", outcome)
+}
+```
+
+## NRC {.tabset}
+
+```{r nrc-sections, results='asis'}
+for (outcome in OUTCOMES$nrc) {
+  render_outcome_section("nrc", outcome)
+}
+```

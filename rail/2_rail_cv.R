@@ -550,110 +550,69 @@ cv_single_config <- function(prepared_data, config_id, outcome = "injuries",
 # BATCH RUNNER WITH CHECKPOINTING
 # ==============================================================================
 
-#' Run CV across all configurations with checkpoint/resume
+#' Run CV for a single outcome across all configurations (internal workhorse)
 #'
-#' @param cfg_dir Directory containing configuration folders
-#' @param rail_raw Raw rail data (event-level)
-#' @param ops_path Path to operational data file
-#' @param outcome Outcome to evaluate
-#' @param config_ids Optional: specific config IDs (default: all)
-#' @param strategies CV strategies to run
-#' @param n_cores Number of parallel workers
-#' @param output_dir Directory for results and checkpoints
-#' @param K, n_splits, test_duration_months, gap_months CV parameters
-#' @param seed Random seed
-#' @return Combined tibble of all CV results
-run_cv_all_configs <- function(cfg_dir,
-                               rail_raw,
-                               ops_path = NULL,
-                               outcome = "injuries",
-                               config_ids = NULL,
-                               strategies = c("group_kfold", "timeseries"),
-                               n_cores = 16,
-                               output_dir = "results/cv",
-                               K = 5, n_splits = 4,
-                               test_duration_months = 6,
-                               gap_months = 0,
-                               seed = 42) {
-  
-  cat("========================================\n")
-  cat(sprintf("CROSS-VALIDATION: Stage 1 Binary - %s\n", toupper(outcome)))
-  cat("========================================\n\n")
-  
-  # Create directories
-  checkpoint_dir <- file.path(output_dir, "checkpoints")
+#' Handles parallel processing with checkpointing for one outcome.
+#'
+#' @param cfg_dir Config directory
+#' @param rail_raw_minimal Minimal rail data (all outcome cols included)
+#' @param ops_features Pre-computed ops features (or NULL)
+#' @param outcome Single outcome string
+#' @param config_ids Config IDs to process
+#' @param strategies CV strategies
+#' @param n_cores Parallel workers
+#' @param output_dir Output directory
+#' @param K, n_splits, test_duration_months, gap_months, seed CV parameters
+#' @return Tibble of CV results for this outcome
+run_single_outcome_cv <- function(cfg_dir, rail_raw_minimal, ops_features,
+                                   outcome, config_ids, strategies,
+                                   n_cores, output_dir,
+                                   K = 5, n_splits = 4,
+                                   test_duration_months = 6,
+                                   gap_months = 0, seed = 42) {
+
+  cat(sprintf("\n  --- CV Outcome: %s ---\n", toupper(outcome)))
+
+  # Per-outcome checkpoint directory to avoid collisions
+  checkpoint_dir <- file.path(output_dir, "checkpoints", outcome)
   dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
-  
-  # Load operational features
-  ops_features <- NULL
-  if (!is.null(ops_path) && file.exists(ops_path)) {
-    cat("Loading operational data...\n")
-    ops_features <- load_and_prepare_ops_features(ops_path, ops_vars = OPS_VARS)
-    cat(sprintf("Operational features ready: %d org-months\n\n", nrow(ops_features)))
-  } else {
-    cat("No operational data. Proceeding without ops covariates.\n\n")
-  }
-  
-  # Get configuration IDs
-  if (is.null(config_ids)) {
-    cfg_path <- file.path(cfg_dir, "_cfg")
-    if (!dir.exists(cfg_path)) {
-      stop(sprintf("Configuration directory not found: %s", cfg_path))
-    }
-    config_ids <- list.dirs(cfg_path, full.names = FALSE, recursive = FALSE)
-    config_ids <- config_ids[config_ids != "" & !startsWith(config_ids, ".")]
-  }
-  
-  # Reduce rail_raw
-  outcome_var <- get_outcome_var(outcome)
-  rail_raw_minimal <- rail_raw %>%
-    select(eid, org_id, event_date, all_of(outcome_var)) %>%
-    distinct()
-  
+
   # Check for existing checkpoints (resume support)
   completed_ids <- list.files(checkpoint_dir, pattern = "\\.parquet$") %>%
     str_remove("\\.parquet$")
   remaining_ids <- setdiff(config_ids, completed_ids)
-  
-  cat(sprintf("Total configurations: %d\n", length(config_ids)))
-  cat(sprintf("Already completed: %d\n", length(completed_ids)))
-  cat(sprintf("Remaining: %d\n", length(remaining_ids)))
-  cat(sprintf("Strategies: %s\n", paste(strategies, collapse = ", ")))
-  
+
+  cat(sprintf("  Total: %d | Completed: %d | Remaining: %d\n",
+              length(config_ids), length(completed_ids), length(remaining_ids)))
+
   n_windows <- nrow(WINDOW_SPECS$sma) + nrow(WINDOW_SPECS$ewma)
-  n_models_per_config <- n_windows * 4 * length(strategies)  # 4 baselines per climate var
-  cat(sprintf("~%d model fits per configuration\n", n_models_per_config))
-  cat(sprintf("~%d total model fits remaining\n\n", n_models_per_config * length(remaining_ids)))
-  
-  if (length(remaining_ids) == 0) {
-    cat("All configurations already completed. Loading checkpoints...\n")
-  } else {
-    cat(sprintf("Using %d cores\n", n_cores))
-    cat("Processing...\n\n")
-    
-    # Parallel processing over configs
+  n_models_per_config <- n_windows * 4 * length(strategies)
+  cat(sprintf("  ~%d model fits per config | ~%d total remaining\n",
+              n_models_per_config, n_models_per_config * length(remaining_ids)))
+
+  if (length(remaining_ids) > 0) {
+    cat(sprintf("  Using %d cores\n", n_cores))
+
     plan(multisession, workers = n_cores)
     start_time <- Sys.time()
-    
+
     progressr::with_progress({
       p <- progressr::progressor(steps = length(remaining_ids))
-      
+
       future_walk(remaining_ids, function(cfg_id) {
-        
+
         checkpoint_path <- file.path(checkpoint_dir, paste0(cfg_id, ".parquet"))
         parquet_path <- file.path(cfg_dir, "_cfg", cfg_id, "results.parquet")
-        
+
         if (!file.exists(parquet_path)) {
           p()
           return(invisible(NULL))
         }
-        
+
         cfg_cv <- tryCatch({
-          # Prepare data (shared function)
           prepared <- prepare_config_data(parquet_path, cfg_id, rail_raw_minimal,
                                           ops_features = ops_features)
-          
-          # Run CV for all climate vars × baselines × strategies
+
           cv_single_config(prepared, cfg_id, outcome = outcome,
                            strategies = strategies, K = K,
                            n_splits = n_splits,
@@ -663,19 +622,21 @@ run_cv_all_configs <- function(cfg_dir,
           warning(sprintf("Config %s failed entirely: %s", cfg_id, e$message))
           tibble(
             config_id = cfg_id,
+            outcome   = outcome,
             status    = "config_failed",
             error     = as.character(e$message)
           )
         })
-        
-        # Save checkpoint
+
         if (!is.null(cfg_cv) && nrow(cfg_cv) > 0) {
+          # Ensure outcome column is present in checkpoint
+          if (!"outcome" %in% names(cfg_cv)) cfg_cv$outcome <- outcome
           arrow::write_parquet(cfg_cv, checkpoint_path)
         }
-        
+
         p()
         invisible(NULL)
-        
+
       }, .options = furrr_options(
         seed = TRUE,
         packages = c("tidyverse", "glmmTMB", "pROC", "arrow", "glue", "slider"),
@@ -691,7 +652,6 @@ run_cv_all_configs <- function(cfg_dir,
           gap_months = gap_months,
           seed = seed,
           checkpoint_dir = checkpoint_dir,
-          # Shared config
           WINDOW_SPECS = WINDOW_SPECS,
           MODEL_FORMULAS = MODEL_FORMULAS,
           OPS_VARS = OPS_VARS,
@@ -699,7 +659,6 @@ run_cv_all_configs <- function(cfg_dir,
           OPS_ROLL_K = OPS_ROLL_K,
           OPS_MIN_HIST = OPS_MIN_HIST,
           OUTCOME_VARS = OUTCOME_VARS,
-          # Functions
           get_outcome_var = get_outcome_var,
           prepare_config_data = prepare_config_data,
           get_climate_vars = get_climate_vars,
@@ -720,108 +679,198 @@ run_cv_all_configs <- function(cfg_dir,
         )
       ))
     })
-    
-    end_time <- Sys.time()
-    elapsed <- difftime(end_time, start_time, units = "mins")
-    cat(sprintf("\n\nCV completed in %.1f minutes\n\n", elapsed))
-    
+
+    elapsed <- difftime(Sys.time(), start_time, units = "mins")
+    cat(sprintf("  CV %s completed in %.1f minutes\n", outcome, elapsed))
     plan(sequential)
   }
-  
-  # Combine all checkpoints
-  cat("Combining checkpoint results...\n")
+
+  # Combine checkpoints for this outcome
   checkpoint_files <- list.files(checkpoint_dir, pattern = "\\.parquet$",
                                  full.names = TRUE)
-  
+
   if (length(checkpoint_files) == 0) {
-    warning("No checkpoint files found!")
+    warning(sprintf("No checkpoint files found for %s", outcome))
     return(tibble())
   }
-  
+
   cv_results <- map_dfr(checkpoint_files, arrow::read_parquet)
-  
-  # Add window metadata (same logic as multiverse script)
-  if ("climate_var_tested" %in% names(cv_results)) {
+
+  # Ensure outcome column
+  if (!"outcome" %in% names(cv_results)) cv_results$outcome <- outcome
+
+  cv_results
+}
+
+
+#' Run CV across all configurations and outcomes with checkpoint/resume
+#'
+#' Iterates over outcomes sequentially, running parallel config sweeps for each.
+#' Produces a single combined parquet with all outcomes.
+#'
+#' @param cfg_dir Directory containing configuration folders
+#' @param rail_raw Raw rail data (event-level)
+#' @param ops_path Path to operational data file
+#' @param outcomes Character vector of outcomes to evaluate.
+#'   Default: all defined outcomes. Pass a single string for backward compatibility.
+#' @param config_ids Optional: specific config IDs (default: all)
+#' @param strategies CV strategies to run
+#' @param n_cores Number of parallel workers
+#' @param output_dir Directory for results and checkpoints
+#' @param K, n_splits, test_duration_months, gap_months CV parameters
+#' @param seed Random seed
+#' @return Combined tibble of all CV results
+run_cv_all_configs <- function(cfg_dir,
+                               rail_raw,
+                               ops_path = NULL,
+                               outcomes = names(OUTCOME_VARS),
+                               config_ids = NULL,
+                               strategies = c("group_kfold", "timeseries"),
+                               n_cores = 16,
+                               output_dir = "results/cv",
+                               K = 5, n_splits = 4,
+                               test_duration_months = 6,
+                               gap_months = 0,
+                               seed = 42) {
+
+  # Backward compatibility: accept single string
+  if (length(outcomes) == 1 && !is.null(names(outcomes))) {
+    outcomes <- unname(outcomes)
+  }
+
+  cat("========================================\n")
+  cat("CROSS-VALIDATION: Stage 1 Binary\n")
+  cat(sprintf("Outcomes: %s\n", paste(outcomes, collapse = ", ")))
+  cat(sprintf("Strategies: %s\n", paste(strategies, collapse = ", ")))
+  cat("========================================\n\n")
+
+  # Create directories
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Load operational features
+  ops_features <- NULL
+  if (!is.null(ops_path) && file.exists(ops_path)) {
+    cat("Loading operational data...\n")
+    ops_features <- load_and_prepare_ops_features(ops_path, ops_vars = OPS_VARS)
+    cat(sprintf("Operational features ready: %d org-months\n\n", nrow(ops_features)))
+  } else {
+    cat("No operational data. Proceeding without ops covariates.\n\n")
+  }
+
+  # Get configuration IDs
+  if (is.null(config_ids)) {
+    cfg_path <- file.path(cfg_dir, "_cfg")
+    if (!dir.exists(cfg_path)) {
+      stop(sprintf("Configuration directory not found: %s", cfg_path))
+    }
+    config_ids <- list.dirs(cfg_path, full.names = FALSE, recursive = FALSE)
+    config_ids <- config_ids[config_ids != "" & !startsWith(config_ids, ".")]
+  }
+
+  # Reduce rail_raw — include ALL outcome vars
+  all_outcome_vars <- unname(OUTCOME_VARS[outcomes])
+  rail_raw_minimal <- rail_raw %>%
+    select(eid, org_id, event_date, any_of(all_outcome_vars)) %>%
+    distinct()
+
+  cat(sprintf("Configurations: %d\n", length(config_ids)))
+
+  # --- Run each outcome sequentially ---
+  overall_start <- Sys.time()
+  outcome_cv_results <- list()
+
+  for (outcome in outcomes) {
+    cv_result <- run_single_outcome_cv(
+      cfg_dir = cfg_dir,
+      rail_raw_minimal = rail_raw_minimal,
+      ops_features = ops_features,
+      outcome = outcome,
+      config_ids = config_ids,
+      strategies = strategies,
+      n_cores = n_cores,
+      output_dir = output_dir,
+      K = K, n_splits = n_splits,
+      test_duration_months = test_duration_months,
+      gap_months = gap_months,
+      seed = seed
+    )
+    outcome_cv_results[[outcome]] <- cv_result
+  }
+
+  overall_elapsed <- difftime(Sys.time(), overall_start, units = "mins")
+
+  # --- Combine all outcomes ---
+  cv_results <- bind_rows(outcome_cv_results)
+
+  # Add window metadata
+  climate_var_col <- if ("climate_var_tested" %in% names(cv_results)) "climate_var_tested" else "climate_var"
+  if (climate_var_col %in% names(cv_results)) {
     cv_results <- cv_results %>%
       mutate(
         window_type = case_when(
-          str_detect(climate_var_tested, "_sma_") ~ "sma",
-          str_detect(climate_var_tested, "_ewmaLAG_") ~ "ewma",
+          str_detect(.data[[climate_var_col]], "_sma_") ~ "sma",
+          str_detect(.data[[climate_var_col]], "_ewmaLAG_") ~ "ewma",
           TRUE ~ "unknown"
         ),
         window_size = case_when(
-          window_type == "sma" ~ as.numeric(str_extract(climate_var_tested, "(?<=_sma_)\\d+")),
+          window_type == "sma" ~ as.numeric(str_extract(.data[[climate_var_col]], "(?<=_sma_)\\d+")),
           TRUE ~ NA_real_
         ),
         lag_days = case_when(
-          window_type == "ewma" ~ as.numeric(str_extract(climate_var_tested, "(?<=_ewmaLAG_)\\d+")),
+          window_type == "ewma" ~ as.numeric(str_extract(.data[[climate_var_col]], "(?<=_ewmaLAG_)\\d+")),
           TRUE ~ NA_real_
         ),
         halflife_days = case_when(
-          window_type == "ewma" ~ as.numeric(str_extract(climate_var_tested, "(?<=_hl)\\d+")),
+          window_type == "ewma" ~ as.numeric(str_extract(.data[[climate_var_col]], "(?<=_hl)\\d+")),
           TRUE ~ NA_real_
         )
       )
   }
-  
-  # Compute delta-Brier for each specification
-  if (nrow(cv_results) > 0 && "model_label" %in% names(cv_results)) {
-    # For each (config_id, climate_var_tested, cv_strategy),
-    # compute full_brier - no_climate_brier
-    delta_brier <- cv_results %>%
-      filter(model_label %in% c(climate_var_tested, "no_climate")) %>%
-      select(config_id, climate_var_tested, cv_strategy, model_label, brier_score_mean) %>%
-      pivot_wider(
-        names_from = model_label,
-        values_from = brier_score_mean,
-        names_prefix = "brier_"
-      )
-    
-    # The full model column name varies by climate_var, so handle dynamically
-    # Actually, model_label for the full model IS the climate_var name
-    # This needs special handling since column names vary
-    # Instead, compute per-row in a simpler way:
+
+  # Compute delta-Brier for each specification (across all outcomes)
+  if (nrow(cv_results) > 0 && "model_label" %in% names(cv_results) &&
+      "climate_var_tested" %in% names(cv_results)) {
+
     full_models <- cv_results %>%
       filter(model_label == climate_var_tested) %>%
-      select(config_id, climate_var_tested, cv_strategy,
+      select(config_id, climate_var_tested, cv_strategy, outcome,
              brier_full = brier_score_mean)
-    
+
     no_climate_models <- cv_results %>%
       filter(model_label == "no_climate") %>%
-      select(config_id, climate_var_tested, cv_strategy,
+      select(config_id, climate_var_tested, cv_strategy, outcome,
              brier_no_climate = brier_score_mean)
-    
+
     delta_brier <- full_models %>%
       inner_join(no_climate_models,
-                 by = c("config_id", "climate_var_tested", "cv_strategy")) %>%
+                 by = c("config_id", "climate_var_tested", "cv_strategy", "outcome")) %>%
       mutate(delta_brier = brier_full - brier_no_climate)
-    
-    # Negative delta = climate helps; positive = climate hurts
+
     cv_results <- cv_results %>%
       left_join(
-        delta_brier %>% select(config_id, climate_var_tested, cv_strategy, delta_brier),
-        by = c("config_id", "climate_var_tested", "cv_strategy")
+        delta_brier %>% select(config_id, climate_var_tested, cv_strategy, outcome, delta_brier),
+        by = c("config_id", "climate_var_tested", "cv_strategy", "outcome")
       )
   }
-  
-  # Save combined results
-  results_path <- file.path(output_dir,
-                            sprintf("rail_%s_cv_results.parquet", outcome))
+
+  # Save combined results — single file for all outcomes
+  results_path <- file.path(output_dir, "rail_cv_results.parquet")
   arrow::write_parquet(cv_results, results_path)
-  cat(sprintf("Combined CV results saved to: %s\n", results_path))
-  
-  # Also save as CSV for easy inspection
-  csv_path <- file.path(output_dir,
-                        sprintf("rail_%s_cv_results.csv", outcome))
+  cat(sprintf("\n========================================\n"))
+  cat(sprintf("Combined CV results saved: %s\n", results_path))
+  cat(sprintf("  Total rows: %d\n", nrow(cv_results)))
+  cat(sprintf("  Outcomes: %s\n", paste(unique(cv_results$outcome), collapse = ", ")))
+
+  csv_path <- file.path(output_dir, "rail_cv_results.csv")
   write_csv(cv_results, csv_path)
-  cat(sprintf("CSV copy saved to: %s\n", csv_path))
-  
+  cat(sprintf("  CSV copy: %s\n", csv_path))
+
   # Print summary
   cat("\n--- CV Summary ---\n")
-  if ("delta_brier" %in% names(cv_results)) {
+  if ("delta_brier" %in% names(cv_results) && "climate_var_tested" %in% names(cv_results)) {
     delta_summary <- cv_results %>%
       filter(model_label == climate_var_tested) %>%
-      group_by(cv_strategy) %>%
+      group_by(outcome, cv_strategy) %>%
       summarise(
         n_specs          = n(),
         n_climate_helps  = sum(delta_brier < 0, na.rm = TRUE),
@@ -832,6 +881,9 @@ run_cv_all_configs <- function(cfg_dir,
       )
     print(delta_summary)
   }
-  
+
+  cat(sprintf("\n  Total time: %.1f minutes\n", overall_elapsed))
+  cat("========================================\n")
+
   return(cv_results)
 }

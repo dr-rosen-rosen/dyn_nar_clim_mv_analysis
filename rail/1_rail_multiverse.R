@@ -419,90 +419,43 @@ analyze_single_config_rail <- function(parquet_path, config_id, rail_raw,
 # BATCH PROCESSING FUNCTION
 # ==============================================================================
 
-#' Run multiverse analysis across all configurations
+#' Run multiverse analysis for a single outcome (internal workhorse)
+#'
+#' Called by run_rail_multiverse() for each outcome. Handles parallel
+#' processing, result extraction, and per-outcome logging.
+#'
 #' @param cfg_dir Directory containing configuration folders
-#' @param rail_raw Raw rail data for joining (event-level data only)
-#' @param ops_path Path to operational data file (CSV or Parquet with monthly data)
-#' @param outcome Outcome to analyze ("injuries", "fatalities", or "costs")
-#' @param config_ids Optional: specific config IDs to run
-#' @param n_cores Number of cores for parallel processing
-#' @param save_models Whether to save full model objects
-#' @param output_dir Directory for saving results
-run_rail_multiverse <- function(cfg_dir, 
-                                rail_raw,
-                                ops_path = NULL,
-                                outcome = "injuries",
-                                config_ids = NULL,
-                                n_cores = 16,
-                                save_models = TRUE,
-                                output_dir = "results") {
-  
-  cat("========================================\n")
-  cat(sprintf("RAIL MULTIVERSE ANALYSIS (glmmTMB) - %s\n", toupper(outcome)))
-  cat("========================================\n\n")
-  
-  # Create output directory
-  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
-  if (save_models) {
-    dir.create(file.path(output_dir, "model_objects"), showWarnings = FALSE)
-  }
-  
-  # Load and prepare operational features (once, before parallel processing)
-  ops_features <- NULL
-  if (!is.null(ops_path) && file.exists(ops_path)) {
-    cat("Loading and preparing operational data...\n")
-    ops_features <- load_and_prepare_ops_features(
-      ops_path,
-      ops_vars = OPS_VARS
-    )
-    cat(sprintf("Operational features ready: %d org-months\n\n", nrow(ops_features)))
-  } else {
-    cat("No operational data provided. Models will be fit without operational covariates.\n")
-    cat("To include operational data, provide ops_path argument.\n\n")
-  }
-  
-  # Get all configuration IDs
-  if (is.null(config_ids)) {
-    cfg_path <- file.path(cfg_dir, "_cfg")
-    if (!dir.exists(cfg_path)) {
-      stop(sprintf("Configuration directory not found: %s", cfg_path))
-    }
-    config_ids <- list.dirs(cfg_path, full.names = FALSE, recursive = FALSE)
-    config_ids <- config_ids[config_ids != "" & !startsWith(config_ids, ".")]
-  }
-  
-  # Reduce rail_raw to only necessary columns (event-level data)
-  outcome_var <- get_outcome_var(outcome)
-  
-  rail_raw_minimal <- rail_raw %>%
-    select(eid, org_id, event_date, all_of(outcome_var)) %>%
-    distinct()
-  
-  cat(sprintf("Reduced rail_raw from %.1f MB to %.1f MB\n",
-              object.size(rail_raw) / 1e6,
-              object.size(rail_raw_minimal) / 1e6))
-  
+#' @param rail_raw_minimal Minimal rail data (eid, org_id, event_date, outcome cols)
+#' @param ops_features Pre-computed operational features (or NULL)
+#' @param outcome Single outcome string
+#' @param config_ids Config IDs to process
+#' @param n_cores Number of parallel workers
+#' @param save_models Whether to save model objects
+#' @param output_dir Output directory
+#' @return List with results_table, n_successful, n_failed
+run_single_outcome_mv <- function(cfg_dir, rail_raw_minimal, ops_features,
+                                   outcome, config_ids, n_cores,
+                                   save_models, output_dir) {
+
+  cat(sprintf("\n  --- Outcome: %s ---\n", toupper(outcome)))
+
   n_configs <- length(config_ids)
   n_windows <- nrow(WINDOW_SPECS$sma) + nrow(WINDOW_SPECS$ewma)
   total_models <- n_configs * n_windows
-  
-  cat(sprintf("Configurations to analyze: %d\n", n_configs))
-  cat(sprintf("Windows per configuration: %d\n", n_windows))
-  cat(sprintf("Total models to fit: %d\n", total_models))
-  cat(sprintf("Using %d cores\n\n", n_cores))
-  
+
+  cat(sprintf("  Models to fit: %d configs × %d windows = %d\n",
+              n_configs, n_windows, total_models))
+
   # Setup parallel processing
   plan(multisession, workers = n_cores)
-  
-  # Process all configurations
+
   start_time <- Sys.time()
-  cat("Processing configurations...\n")
   progressr::with_progress({
     p <- progressr::progressor(steps = n_configs)
     all_results <- future_map(config_ids, function(cfg_id) {
-      
+
       parquet_path <- file.path(cfg_dir, "_cfg", cfg_id, "results.parquet")
-      
+
       if (!file.exists(parquet_path)) {
         p()
         return(list(list(
@@ -514,9 +467,9 @@ run_rail_multiverse <- function(cfg_dir,
           n_obs = NA_integer_
         )))
       }
-      
+
       cfg_results <- tryCatch({
-        analyze_single_config_rail(parquet_path, cfg_id, rail_raw_minimal, 
+        analyze_single_config_rail(parquet_path, cfg_id, rail_raw_minimal,
                                    ops_features = ops_features, outcome = outcome)
       }, error = function(e) {
         list(list(
@@ -530,7 +483,7 @@ run_rail_multiverse <- function(cfg_dir,
       })
       p()
       return(cfg_results)
-      
+
     }, .options = furrr_options(
       seed = TRUE,
       packages = c("tidyverse", "glmmTMB", "broom.mixed", "arrow", "glue", "slider"),
@@ -558,25 +511,23 @@ run_rail_multiverse <- function(cfg_dir,
   })
   end_time <- Sys.time()
   elapsed <- difftime(end_time, start_time, units = "mins")
-  
-  cat(sprintf("\n\nCompleted in %.1f minutes\n\n", elapsed))
-  
+
+  cat(sprintf("  Completed %s in %.1f minutes\n", outcome, elapsed))
+
   # Flatten results
   all_results_flat <- flatten(all_results)
-  
+
   # Separate successful and failed
   successful <- keep(all_results_flat, ~.x$status %in% c("success", "convergence_warning"))
   failed <- keep(all_results_flat, ~.x$status == "failed")
-  
-  cat(sprintf("Results Summary:\n"))
-  cat(sprintf("  Successful: %d (%.1f%%)\n", 
-              length(successful), 
-              100 * length(successful) / length(all_results_flat)))
-  cat(sprintf("  Failed: %d (%.1f%%)\n\n",
+
+  cat(sprintf("  Successful: %d (%.1f%%)  |  Failed: %d (%.1f%%)\n",
+              length(successful),
+              100 * length(successful) / max(length(all_results_flat), 1),
               length(failed),
-              100 * length(failed) / length(all_results_flat)))
-  
-  # Save failed results
+              100 * length(failed) / max(length(all_results_flat), 1)))
+
+  # Save failed results log
   if (length(failed) > 0) {
     failed_table <- map_dfr(failed, function(r) {
       tibble(
@@ -590,50 +541,53 @@ run_rail_multiverse <- function(cfg_dir,
     })
     failed_path <- file.path(output_dir, sprintf("rail_%s_failed_models.csv", outcome))
     write_csv(failed_table, failed_path)
-    cat(sprintf("Failed models log saved to: %s\n", failed_path))
-    
-    cat("\nSample of failure reasons:\n")
-    error_summary <- failed_table %>%
-      count(error, sort = TRUE) %>%
-      head(10)
+
+    cat(sprintf("  Failed models log: %s\n", failed_path))
+    error_summary <- failed_table %>% count(error, sort = TRUE) %>% head(5)
     print(error_summary)
   }
-  
-  # Early return if no successes
+
+  # Save model objects if requested (still per-outcome for manageability)
+  if (save_models && length(successful) > 0) {
+    dir.create(file.path(output_dir, "model_objects"), showWarnings = FALSE)
+    models_path <- file.path(output_dir, "model_objects",
+                             sprintf("rail_%s_models.rds", outcome))
+    saveRDS(successful, models_path)
+    cat(sprintf("  Model objects: %s\n", models_path))
+  }
+
+  # Extract results table (empty tibble if no successes)
   if (length(successful) == 0) {
-    cat("\nWARNING: No successful models! Check failed_models.csv for errors.\n")
     plan(sequential)
     return(list(
       results_table = tibble(),
       n_successful = 0,
-      n_failed = length(failed),
-      elapsed_minutes = as.numeric(elapsed)
+      n_failed = length(failed)
     ))
   }
-  
-  # Extract results table
+
   results_table <- map_dfr(successful, function(r) {
     base_result <- tibble(
       config_id = r$config_id,
       climate_var = r$climate_var,
       outcome = r$outcome,
       status = r$status,
-      
+
       climate_estimate_cond = r$climate_estimate_cond,
       climate_se_cond = r$climate_se_cond,
       climate_pval_cond = r$climate_pval_cond,
       climate_conf_low_cond = r$climate_conf_low_cond,
       climate_conf_high_cond = r$climate_conf_high_cond,
-      
+
       climate_estimate_zi = r$climate_estimate_zi,
       climate_se_zi = r$climate_se_zi,
       climate_pval_zi = r$climate_pval_zi,
       climate_conf_low_zi = r$climate_conf_low_zi,
       climate_conf_high_zi = r$climate_conf_high_zi,
-      
+
       random_intercept_sd_cond = r$random_intercept_sd_cond,
       random_intercept_sd_zi = r$random_intercept_sd_zi,
-      
+
       AIC = r$AIC,
       BIC = r$BIC,
       logLik = r$logLik,
@@ -643,11 +597,11 @@ run_rail_multiverse <- function(cfg_dir,
       n_nonzeros = r$n_nonzeros,
       pct_zeros = r$pct_zeros
     )
-    
+
     # Add operational effects dynamically
     ops_between_vars <- paste0(OPS_VARS, "_between")
     ops_within_vars <- paste0(OPS_VARS, "_within")
-    
+
     for (v in c(ops_between_vars, ops_within_vars)) {
       base_result[[paste0(v, "_estimate_cond")]] <- r[[paste0(v, "_estimate_cond")]] %||% NA_real_
       base_result[[paste0(v, "_se_cond")]] <- r[[paste0(v, "_se_cond")]] %||% NA_real_
@@ -660,52 +614,157 @@ run_rail_multiverse <- function(cfg_dir,
       base_result[[paste0(v, "_conf_low_zi")]] <- r[[paste0(v, "_conf_low_zi")]] %||% NA_real_
       base_result[[paste0(v, "_conf_high_zi")]] <- r[[paste0(v, "_conf_high_zi")]] %||% NA_real_
     }
-    
+
     base_result
   })
-  
-  # Add window metadata
-  results_table <- results_table %>%
-    mutate(
-      window_type = case_when(
-        str_detect(.data$climate_var, "_sma_") ~ "sma",
-        str_detect(.data$climate_var, "_ewmaLAG_") ~ "ewma",
-        TRUE ~ "unknown"
-      ),
-      window_size = case_when(
-        .data$window_type == "sma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_sma_)\\d+")),
-        TRUE ~ NA_real_
-      ),
-      lag_days = case_when(
-        .data$window_type == "ewma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_ewmaLAG_)\\d+")),
-        TRUE ~ NA_real_
-      ),
-      halflife_days = case_when(
-        .data$window_type == "ewma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_hl)\\d+")),
-        TRUE ~ NA_real_
-      )
-    )
-  
-  # Save results table
-  results_path <- file.path(output_dir, sprintf("rail_%s_multiverse_results.parquet", outcome))
-  arrow::write_parquet(results_table, results_path)
-  cat(sprintf("Results table saved to: %s\n", results_path))
-  
-  # Save model objects if requested
-  if (save_models) {
-    models_path <- file.path(output_dir, "model_objects", 
-                             sprintf("rail_%s_models.rds", outcome))
-    saveRDS(successful, models_path)
-    cat(sprintf("Model objects saved to: %s\n", models_path))
-  }
-  
-  # Clean up
+
   plan(sequential)
-  
-  return(list(
+
+  list(
     results_table = results_table,
     n_successful = length(successful),
-    n_failed = length(failed),
-    elapsed_minutes = as.numeric(elapsed)
+    n_failed = length(failed)
+  )
+}
+
+
+#' Run multiverse analysis across all configurations and outcomes
+#'
+#' Iterates over outcomes sequentially, running parallel config sweeps for each.
+#' Produces a single combined parquet with all outcomes.
+#'
+#' @param cfg_dir Directory containing configuration folders
+#' @param rail_raw Raw rail data for joining (event-level data only)
+#' @param ops_path Path to operational data file (CSV or Parquet with monthly data)
+#' @param outcomes Character vector of outcomes to analyze.
+#'   Default: all defined outcomes. Pass a single string for backward compatibility.
+#' @param config_ids Optional: specific config IDs to run
+#' @param n_cores Number of cores for parallel processing
+#' @param save_models Whether to save full model objects (per-outcome .rds)
+#' @param output_dir Directory for saving results
+run_rail_multiverse <- function(cfg_dir,
+                                rail_raw,
+                                ops_path = NULL,
+                                outcomes = names(OUTCOME_VARS),
+                                config_ids = NULL,
+                                n_cores = 16,
+                                save_models = TRUE,
+                                output_dir = "results") {
+
+  # Backward compatibility: accept single string
+  if (length(outcomes) == 1 && !is.null(names(outcomes))) {
+    outcomes <- unname(outcomes)
+  }
+
+  cat("========================================\n")
+  cat("RAIL MULTIVERSE ANALYSIS (glmmTMB)\n")
+  cat(sprintf("Outcomes: %s\n", paste(outcomes, collapse = ", ")))
+  cat("========================================\n\n")
+
+  # Create output directory
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Load and prepare operational features (once for all outcomes)
+  ops_features <- NULL
+  if (!is.null(ops_path) && file.exists(ops_path)) {
+    cat("Loading and preparing operational data...\n")
+    ops_features <- load_and_prepare_ops_features(
+      ops_path,
+      ops_vars = OPS_VARS
+    )
+    cat(sprintf("Operational features ready: %d org-months\n\n", nrow(ops_features)))
+  } else {
+    cat("No operational data provided. Models will be fit without operational covariates.\n\n")
+  }
+
+  # Get all configuration IDs
+  if (is.null(config_ids)) {
+    cfg_path <- file.path(cfg_dir, "_cfg")
+    if (!dir.exists(cfg_path)) {
+      stop(sprintf("Configuration directory not found: %s", cfg_path))
+    }
+    config_ids <- list.dirs(cfg_path, full.names = FALSE, recursive = FALSE)
+    config_ids <- config_ids[config_ids != "" & !startsWith(config_ids, ".")]
+  }
+
+  # Reduce rail_raw to necessary columns — include ALL outcome vars
+  all_outcome_vars <- unname(OUTCOME_VARS[outcomes])
+  rail_raw_minimal <- rail_raw %>%
+    select(eid, org_id, event_date, any_of(all_outcome_vars)) %>%
+    distinct()
+
+  cat(sprintf("Reduced rail_raw from %.1f MB to %.1f MB\n",
+              object.size(rail_raw) / 1e6,
+              object.size(rail_raw_minimal) / 1e6))
+  cat(sprintf("Configurations: %d\n", length(config_ids)))
+  cat(sprintf("Windows per config: %d\n", nrow(WINDOW_SPECS$sma) + nrow(WINDOW_SPECS$ewma)))
+
+  # --- Run each outcome sequentially ---
+  overall_start <- Sys.time()
+  outcome_results <- list()
+
+  for (outcome in outcomes) {
+    result <- run_single_outcome_mv(
+      cfg_dir = cfg_dir,
+      rail_raw_minimal = rail_raw_minimal,
+      ops_features = ops_features,
+      outcome = outcome,
+      config_ids = config_ids,
+      n_cores = n_cores,
+      save_models = save_models,
+      output_dir = output_dir
+    )
+    outcome_results[[outcome]] <- result
+  }
+
+  overall_elapsed <- difftime(Sys.time(), overall_start, units = "mins")
+
+  # --- Combine all outcomes into one table ---
+  combined_results <- map_dfr(outcome_results, ~ .x$results_table)
+
+  # Add window metadata
+  if (nrow(combined_results) > 0) {
+    combined_results <- combined_results %>%
+      mutate(
+        window_type = case_when(
+          str_detect(.data$climate_var, "_sma_") ~ "sma",
+          str_detect(.data$climate_var, "_ewmaLAG_") ~ "ewma",
+          TRUE ~ "unknown"
+        ),
+        window_size = case_when(
+          .data$window_type == "sma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_sma_)\\d+")),
+          TRUE ~ NA_real_
+        ),
+        lag_days = case_when(
+          .data$window_type == "ewma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_ewmaLAG_)\\d+")),
+          TRUE ~ NA_real_
+        ),
+        halflife_days = case_when(
+          .data$window_type == "ewma" ~ as.numeric(str_extract(.data$climate_var, "(?<=_hl)\\d+")),
+          TRUE ~ NA_real_
+        )
+      )
+  }
+
+  # Save combined results — single file for all outcomes
+  results_path <- file.path(output_dir, "rail_multiverse_results.parquet")
+  arrow::write_parquet(combined_results, results_path)
+  cat(sprintf("\n========================================\n"))
+  cat(sprintf("Combined results saved: %s\n", results_path))
+  cat(sprintf("  Total rows: %d\n", nrow(combined_results)))
+  cat(sprintf("  Outcomes: %s\n", paste(unique(combined_results$outcome), collapse = ", ")))
+
+  total_successful <- sum(sapply(outcome_results, function(x) x$n_successful))
+  total_failed     <- sum(sapply(outcome_results, function(x) x$n_failed))
+  cat(sprintf("  Successful: %d  |  Failed: %d\n", total_successful, total_failed))
+  cat(sprintf("  Total time: %.1f minutes\n", overall_elapsed))
+  cat("========================================\n")
+
+  return(list(
+    results_table = combined_results,
+    n_successful = total_successful,
+    n_failed = total_failed,
+    elapsed_minutes = as.numeric(overall_elapsed),
+    per_outcome = outcome_results
   ))
 }

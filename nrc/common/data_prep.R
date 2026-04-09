@@ -394,23 +394,70 @@ prepare_nrc_config_data <- function(parquet_path, config_id, nrc_events,
   }
 
   # --- Emergency classification ---
-  if ("emerg_class" %in% names(df) && !"emerg_class_ord" %in% names(df)) {
+  if ("emerg_class" %in% names(df) && !("emerg_class_ord" %in% names(df))) {
     df <- df %>%
       mutate(
         .ec_raw = tolower(trimws(as.character(emerg_class))),
         emerg_class_ord = case_when(
-          .ec_raw %in% c("ge", "general emergency")      ~ 4L,
-          .ec_raw %in% c("sae", "site area emergency")   ~ 3L,
-          .ec_raw == "alert"                              ~ 2L,
-          .ec_raw %in% c("ue", "nue", "unusual event")   ~ 1L,
-          TRUE                                            ~ 0L
+          .ec_raw %in% c("ge", "general emergency")                   ~ 4L,
+          .ec_raw %in% c("sae", "site area emergency")                ~ 3L,
+          .ec_raw %in% c("ale", "alert")                              ~ 2L,
+          .ec_raw %in% c("ue", "unu", "nue", "unusual event")         ~ 1L,
+          .ec_raw %in% c("non emergency", "none", "n/a", "na", "nan",
+                         "", "non-emergency")                          ~ 0L,
+          TRUE                                                         ~ 0L
         ),
-        emerg_class_ord_factor = factor(emerg_class_ord, ordered = TRUE)
+        emerg_class_ord_factor = factor(emerg_class_ord, ordered = TRUE),
+        emerg_binary = as.integer(emerg_class_ord > 0)
       ) %>%
       select(-.ec_raw)
   } else if ("emerg_class_ord" %in% names(df)) {
     df <- df %>%
-      mutate(emerg_class_ord_factor = factor(emerg_class_ord, ordered = TRUE))
+      mutate(
+        emerg_class_ord_factor = factor(emerg_class_ord, ordered = TRUE),
+        emerg_binary = as.integer(emerg_class_ord > 0)
+             )
+  }
+  
+  # --- Power loss ---
+  if (all(c("initial_pwr", "current_pwr") %in% names(df))) {
+    df <- df %>%
+      mutate(
+        initial_pwr = as.numeric(initial_pwr),
+        current_pwr = as.numeric(current_pwr),
+        power_loss_pct = case_when(
+          is.na(initial_pwr) | is.na(current_pwr) ~ NA_real_,
+          TRUE ~ pmax(initial_pwr - current_pwr, 0)
+        ),
+        power_loss_binary = case_when(
+          is.na(power_loss_pct)  ~ NA_integer_,
+          power_loss_pct > 0     ~ 1L,
+          TRUE                   ~ 0L
+        )
+      )
+    
+    n_valid <- sum(!is.na(df$power_loss_pct))
+    n_zero <- sum(df$power_loss_pct == 0, na.rm = TRUE)
+    n_pos <- sum(df$power_loss_pct > 0, na.rm = TRUE)
+    n_na <- sum(is.na(df$power_loss_pct))
+    message(sprintf("  Power loss: valid=%s (zero=%s, nonzero=%s), NA=%s",
+                    format(n_valid, big.mark = ","),
+                    format(n_zero, big.mark = ","),
+                    format(n_pos, big.mark = ","),
+                    format(n_na, big.mark = ",")))
+    
+  } else if ("power_loss_pct" %in% names(df)) {
+    # Already derived upstream
+    df <- df %>%
+      mutate(
+        power_loss_pct = as.numeric(power_loss_pct),
+        power_loss_pct = pmax(ifelse(is.na(power_loss_pct), NA_real_, power_loss_pct), 0),
+        power_loss_binary = case_when(
+          is.na(power_loss_pct)  ~ NA_integer_,
+          power_loss_pct > 0     ~ 1L,
+          TRUE                   ~ 0L
+        )
+      )
   }
 
   # Ensure year is a factor for fixed effects

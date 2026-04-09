@@ -35,8 +35,8 @@ WINDOW_SPECS <- list(
 # Available after processing: action_matrix_col, findings_count, findings_nongreen_count
 # Phase 2 (power status): capacity_factor, power_std, n_shutdowns
 NRC_OPS_VARS <- c(
-  "capacity_factor", "power_std"
-  #"action_matrix_col", "findings_count"
+  "capacity_factor", "power_std",
+  "action_matrix_col", "findings_count"
   )
 
 # Rolling window parameters for between/within decomposition
@@ -72,6 +72,24 @@ OUTCOME_VARS <- list(
     family    = "cumulative",
     model_fn  = "clmm",
     label     = "Emergency classification"
+  ),
+  emerg_binary = list(
+    var       = "emerg_binary",
+    family    = "binomial",
+    model_fn  = "glmer",
+    label     = "Emergency declaration (binary)"
+  ),
+  power_loss_binary = list(
+    var       = "power_loss_binary",    # 0/1: any power loss vs. none
+    family    = "binomial",
+    model_fn  = "glmer",
+    label     = "Binary power loss"
+  ),
+  power_loss_pct = list(
+    var       = "power_loss_pct",       # continuous 0-100: % power lost
+    family    = "hurdle",               # hurdle: many zeros + continuous severity
+    model_fn  = "glmmTMB",
+    label     = "Power loss severity (%)"
   )
 )
 
@@ -108,9 +126,8 @@ get_outcome_config <- function(outcome) {
 .temporal_controls_ordinal <- "yearmonth_num_c + sin_month + cos_month"
 
 .ops_covariates <- paste0(
-  #"action_matrix_col_between + action_matrix_col_within + ",
-  #"findings_count_between + findings_count_within"
-  #"action_matrix_col_between + action_matrix_col_within"
+  "action_matrix_col_between + action_matrix_col_within + ",
+  "findings_count_between + findings_count_within + ",
   "capacity_factor_between + capacity_factor_within + ",
   "power_std_between + power_std_within"
 )
@@ -135,6 +152,31 @@ MODEL_FORMULAS <- list(
     "emerg_class_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates, " + ",
     "CLIMATE_VAR"
+  ),
+  emerg_binary = paste0(
+    "emerg_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates, " + ",
+    "CLIMATE_VAR + (1 | facility)"
+  ),
+  power_loss_binary = paste0(
+    "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates, " + ",
+    "CLIMATE_VAR + (1 | facility)"
+  ), 
+  # Power loss: two-part model (matches rail costs approach)
+  # Part 1 (binary): did any power loss occur?
+  # Part 2 (gamma):  how much, given loss > 0?
+  power_loss_pct = list(
+    binary = paste0(
+      "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + ",
+      "CLIMATE_VAR + (1 | facility)"
+    ),
+    gamma = paste0(
+      "power_loss_pct ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + ",
+      "CLIMATE_VAR + (1 | facility)"
+    )
   )
 )
 
@@ -151,12 +193,36 @@ MODEL_FORMULAS_NO_CLIMATE <- list(
   emerg_class = paste0(
     "emerg_class_ord_factor ~ ", .temporal_controls_ordinal, " + ",
     .ops_covariates
+  ),
+  emerg_binary = paste0(
+    "emerg_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates
+  ),
+  power_loss_binary = paste0(
+    "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates, " + (1 | facility)"
+  ),
+  power_loss_pct = list(
+    binary = paste0(
+      "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + (1 | facility)"
+    ),
+    gamma = paste0(
+      "power_loss_pct ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + (1 | facility)"
+    )
   )
 )
 
 # Intercept-only formula (for CV baseline)
 MODEL_FORMULAS_INTERCEPT <- list(
-  binary_scram = "scram_binary ~ 1 + (1 | facility)"
+  binary_scram = "scram_binary ~ 1 + (1 | facility)",
+  power_loss_binary = "power_loss_binary ~ 1 + (1 | facility)",
+  emerg_binary = "emerg_binary ~ 1 + (1 | facility)",
+  power_loss_pct = list(
+    binary = "power_loss_binary ~ 1 + (1 | facility)",
+    gamma  = "power_loss_pct ~ 1 + (1 | facility)"
+  )
 )
 
 # Seasonal-only formula (temporal controls + ops, no climate — for CV)
@@ -164,6 +230,24 @@ MODEL_FORMULAS_SEASONAL <- list(
   binary_scram = paste0(
     "scram_binary ~ ", .temporal_controls_binary, " + ",
     .ops_covariates, " + (1 | facility)"
+  ),
+  power_loss_binary = paste0(
+    "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates, " + (1 | facility)"
+  ),
+  emerg_binary = paste0(
+    "emerg_binary ~ ", .temporal_controls_binary, " + ",
+    .ops_covariates, " + (1 | facility)"
+  ),
+  power_loss_pct = list(
+    binary = paste0(
+      "power_loss_binary ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + (1 | facility)"
+    ),
+    gamma = paste0(
+      "power_loss_pct ~ ", .temporal_controls_binary, " + ",
+      .ops_covariates, " + (1 | facility)"
+    )
   )
 )
 
@@ -176,7 +260,11 @@ MODEL_FORMULAS_SEASONAL <- list(
 #' @param climate_var Actual climate variable name
 #' @return Formula string with substitution
 build_formula <- function(formula_template, climate_var) {
-  gsub("CLIMATE_VAR", climate_var, formula_template, fixed = TRUE)
+  if (is.list(formula_template)) {
+    lapply(formula_template, function(f) gsub("CLIMATE_VAR", climate_var, f, fixed = TRUE))
+  } else {
+    gsub("CLIMATE_VAR", climate_var, formula_template, fixed = TRUE)
+  }
 }
 
 # ==============================================================================

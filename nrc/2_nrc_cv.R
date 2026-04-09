@@ -1,15 +1,24 @@
 # 2_nrc_cv.R
-# NRC Nuclear Cross-Validation Analysis — Binary Scram Only
+# NRC Nuclear Cross-Validation Analysis
+# Outcomes: power_loss_pct (binary gate), emerg_binary, (optionally binary_scram)
 # Strategies: Group K-Fold (hold out facilities) + Time-Series Expanding Window
 # Baselines: intercept-only, seasonal+ops-only, full with climate
 # Mike Rose — Safety Climate Analysis
 #
-# Runs CV for all configurations × all window specs.
-# Produces Brier score, AUC, log-loss for each specification.
+# Updated: March 2026
+# Changes:
+#   - Generalized from binary_scram-only to multiple outcomes
+#   - power_loss_pct CV uses binary gate (did power loss occur?) with Brier/AUC
+#   - Optional Gamma conditional CV (RMSE on positive cases)
+#   - emerg_binary CV uses same binary framework
+#   - Outcome-specific formula building via build_outcome_formula()
+#   - glmmTMB support for hurdle binary gate alongside lme4::glmer
 
 library(tidyverse)
 library(lme4)
+library(glmmTMB)
 library(pROC)
+library(broom.mixed)
 library(arrow)
 library(furrr)
 library(glue)
@@ -17,7 +26,7 @@ library(here)
 library(slider)
 
 # Source shared modules
-common_dir <- file.path(here::here(), "common")
+common_dir <- file.path(here::here(), "nrc/common")
 if (!dir.exists(common_dir)) common_dir <- "common"
 source(file.path(common_dir, "config.R"))
 source(file.path(common_dir, "data_prep.R"))
@@ -58,19 +67,155 @@ compute_binary_metrics <- function(y_true, p_pred) {
 }
 
 
+#' Compute metrics for Gamma conditional model (positive cases only)
+#'
+#' @param y_true Observed positive values
+#' @param y_pred Predicted positive values
+#' @return Named list: rmse, mae, mape, n_obs
+compute_gamma_metrics <- function(y_true, y_pred) {
+  residuals <- y_true - y_pred
+  list(
+    rmse  = sqrt(mean(residuals^2)),
+    mae   = mean(abs(residuals)),
+    mape  = mean(abs(residuals / pmax(y_true, 0.01))) * 100,
+    n_obs = length(y_true)
+  )
+}
+
+
+# ==============================================================================
+# OUTCOME-SPECIFIC FORMULA HELPERS FOR CV
+# ==============================================================================
+
+#' Build CV formulas for a given outcome
+#'
+#' Returns a list of formula objects for the three model variants:
+#'   intercept_only, seasonal_ops, full (with climate)
+#'
+#' For hurdle outcomes (power_loss_pct), returns the BINARY GATE formula
+#' (i.e., power_loss_binary ~ ...) since CV uses Brier/AUC on the binary part.
+#'
+#' @param outcome Outcome name (e.g., "power_loss_pct", "emerg_binary")
+#' @param climate_var Climate variable name
+#' @return List of lists: each with $fml (formula) and $label (string)
+build_cv_formulas <- function(outcome, climate_var) {
+
+  # Determine the outcome variable and formula source
+  outcome_config <- get_outcome_config(outcome)
+
+  if (outcome_config$family == "hurdle") {
+    # Hurdle outcome: CV on the binary gate
+    # Extract the binary formula from the list templates
+    fml_full_template <- MODEL_FORMULAS[[outcome]]
+    fml_seasonal_template <- MODEL_FORMULAS_SEASONAL[[outcome]]
+    fml_intercept_template <- MODEL_FORMULAS_INTERCEPT[[outcome]]
+
+    # Get the binary part — could be keyed as 'binary' or 'cond'/'zi'
+    # For CV, we need the formula that predicts the binary gate
+    # The binary gate formula uses power_loss_binary as the LHS
+    get_binary_part <- function(template) {
+      if ("binary" %in% names(template)) {
+        return(template$binary)
+      } else {
+        # If using cond/zi convention, build a binary formula from the cond part
+        # by replacing the outcome var with the binary version
+        cond_str <- template$cond
+        # Replace "power_loss_pct ~" with "power_loss_binary ~"
+        # or "pct_power_loss ~" with "power_loss_binary ~"
+        cond_str <- sub("^\\S+\\s*~", "power_loss_binary ~", cond_str)
+        return(cond_str)
+      }
+    }
+
+    fml_full_str <- get_binary_part(fml_full_template)
+    fml_full_str <- gsub("CLIMATE_VAR", climate_var, fml_full_str, fixed = TRUE)
+    fml_seasonal_str <- get_binary_part(fml_seasonal_template)
+    fml_intercept_str <- get_binary_part(fml_intercept_template)
+
+    # Also replace outcome var in intercept/seasonal if needed
+    fml_intercept_str <- sub("^\\S+\\s*~", "power_loss_binary ~", fml_intercept_str)
+    fml_seasonal_str <- sub("^\\S+\\s*~", "power_loss_binary ~", fml_seasonal_str)
+
+    list(
+      list(fml = as.formula(fml_intercept_str), label = "intercept_only"),
+      list(fml = as.formula(fml_seasonal_str),  label = "seasonal_ops"),
+      list(fml = as.formula(fml_full_str),      label = "full")
+    )
+
+  } else {
+    # Binary or ordinal — straightforward single-formula
+    fml_full      <- build_outcome_formula(outcome, climate_var)
+    fml_seasonal  <- build_seasonal_formula(outcome)
+    fml_intercept <- build_intercept_formula(outcome)
+
+    list(
+      list(fml = fml_intercept, label = "intercept_only"),
+      list(fml = fml_seasonal,  label = "seasonal_ops"),
+      list(fml = fml_full,      label = "full")
+    )
+  }
+}
+
+
+#' Get the outcome variable name to use for CV predictions
+#'
+#' For hurdle outcomes, returns the binary gate variable.
+#' For binary outcomes, returns the outcome variable directly.
+#'
+#' @param outcome Outcome name
+#' @return Character: column name in the data to evaluate predictions against
+get_cv_outcome_var <- function(outcome) {
+  outcome_config <- get_outcome_config(outcome)
+
+  if (outcome_config$family == "hurdle") {
+    # CV evaluates the binary gate
+    "power_loss_binary"
+  } else if (outcome_config$family == "binomial") {
+    outcome_config$var
+  } else {
+    stop(sprintf("CV not supported for family: %s (outcome: %s)",
+                 outcome_config$family, outcome))
+  }
+}
+
+
+#' Get the model fitting function for CV
+#'
+#' @param outcome Outcome name
+#' @return Character: "glmer" or "glmmTMB"
+get_cv_model_fn <- function(outcome) {
+  outcome_config <- get_outcome_config(outcome)
+
+  if (outcome_config$family == "hurdle") {
+    # Binary gate of hurdle — use glmmTMB for consistency with multiverse
+    "glmmTMB"
+  } else if (outcome_config$model_fn == "glmer") {
+    "glmer"
+  } else {
+    # Default to glmer for binary
+    "glmer"
+  }
+}
+
+
 # ==============================================================================
 # CV ENGINE: GROUP K-FOLD (Strategy A)
 # ==============================================================================
 
 #' Group K-Fold CV — hold out entire facilities
 #'
+#' Generalized to support any binary outcome via outcome_var and model_fn.
+#'
 #' @param data Prepared data frame
-#' @param formula_obj Formula object for glmer
+#' @param formula_obj Formula object
 #' @param model_label Label for this model variant
 #' @param K Number of folds
+#' @param outcome_var Column name of the binary outcome (0/1)
+#' @param model_fn "glmer" or "glmmTMB"
 #' @return List with fold_results and summary
 cv_group_kfold <- function(data, formula_obj, model_label = "full",
-                            K = 5) {
+                           K = 5, outcome_var = "scram_binary",
+                           model_fn = "glmer") {
 
   facilities <- unique(data$facility)
   n_fac <- length(facilities)
@@ -94,15 +239,19 @@ cv_group_kfold <- function(data, formula_obj, model_label = "full",
     train_data <- data %>% filter(fold != k)
     test_data  <- data %>% filter(fold == k)
 
-    if (nrow(test_data) == 0 || sum(test_data$scram_binary) == 0) {
+    if (nrow(test_data) == 0 || sum(test_data[[outcome_var]]) == 0) {
       fold_results[[k]] <- tibble(fold = k, status = "empty_test")
       next
     }
 
-    # Fit on training data
+    # Fit model on training data
     fit <- tryCatch({
-      glmer(formula_obj, data = train_data, family = binomial,
-            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+      if (model_fn == "glmmTMB") {
+        glmmTMB(formula_obj, data = train_data, family = binomial(link = "logit"))
+      } else {
+        glmer(formula_obj, data = train_data, family = binomial,
+              control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+      }
     }, error = function(e) NULL)
 
     if (is.null(fit)) {
@@ -110,11 +259,20 @@ cv_group_kfold <- function(data, formula_obj, model_label = "full",
       next
     }
 
-    converged <- is.null(fit@optinfo$conv$lme4$messages)
+    # Check convergence
+    converged <- if (model_fn == "glmmTMB") {
+      is.null(fit$fit$convergence) || fit$fit$convergence == 0
+    } else {
+      is.null(fit@optinfo$conv$lme4$messages)
+    }
 
-    # Predict on test data — new facilities, so use re.form = NA (population level)
+    # Predict on test data — new facilities, so use population-level (re.form = NA)
     p_event <- tryCatch({
-      predict(fit, newdata = test_data, type = "response", re.form = NA)
+      if (model_fn == "glmmTMB") {
+        predict(fit, newdata = test_data, type = "response", re.form = NA)
+      } else {
+        predict(fit, newdata = test_data, type = "response", re.form = NA)
+      }
     }, error = function(e) NULL)
 
     if (is.null(p_event)) {
@@ -122,7 +280,7 @@ cv_group_kfold <- function(data, formula_obj, model_label = "full",
       next
     }
 
-    metrics <- compute_binary_metrics(test_data$scram_binary, p_event)
+    metrics <- compute_binary_metrics(test_data[[outcome_var]], p_event)
 
     fold_results[[k]] <- tibble(
       fold            = k,
@@ -148,11 +306,11 @@ cv_group_kfold <- function(data, formula_obj, model_label = "full",
 
   summary_row <- successful %>%
     summarise(
-      brier_mean  = mean(brier_score, na.rm = TRUE),
-      brier_sd    = sd(brier_score, na.rm = TRUE),
-      auc_mean    = mean(auc_roc, na.rm = TRUE),
-      logloss_mean = mean(log_loss, na.rm = TRUE),
-      n_folds     = n(),
+      brier_score_mean = mean(brier_score, na.rm = TRUE),
+      brier_score_sd   = sd(brier_score, na.rm = TRUE),
+      auc_roc_mean     = mean(auc_roc, na.rm = TRUE),
+      log_loss_mean    = mean(log_loss, na.rm = TRUE),
+      n_folds          = n(),
       .groups = "drop"
     ) %>%
     mutate(model_label = model_label, cv_strategy = "group_kfold")
@@ -170,13 +328,21 @@ cv_group_kfold <- function(data, formula_obj, model_label = "full",
 #' Facilities appear in both train and test. Uses conditional predictions
 #' (facility random effects) since facilities are known.
 #'
-#' @param data Prepared data frame with year column
-#' @param formula_obj Formula object for glmer
+#' @param data Prepared data frame with event_date or year column
+#' @param formula_obj Formula object
 #' @param model_label Label for this model variant
 #' @param min_train_years Minimum years of training data before first test
+#' @param outcome_var Column name of the binary outcome (0/1)
+#' @param model_fn "glmer" or "glmmTMB"
 #' @return List with fold_results and summary
 cv_timeseries <- function(data, formula_obj, model_label = "full",
-                           min_train_years = 5) {
+                          min_train_years = 5, outcome_var = "scram_binary",
+                          model_fn = "glmer") {
+
+  # Derive year if not present
+  if (!"year" %in% names(data) && "event_date" %in% names(data)) {
+    data <- data %>% mutate(year = factor(lubridate::year(event_date)))
+  }
 
   years_available <- sort(unique(as.integer(as.character(data$year))))
 
@@ -194,14 +360,19 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
     train_data <- data %>% filter(as.integer(as.character(year)) %in% train_yrs)
     test_data  <- data %>% filter(as.integer(as.character(year)) == test_yr)
 
-    if (nrow(test_data) == 0 || sum(test_data$scram_binary) == 0) {
+    if (nrow(test_data) == 0 || sum(test_data[[outcome_var]]) == 0) {
       fold_results[[i]] <- tibble(fold = i, test_year = test_yr, status = "empty_test")
       next
     }
 
+    # Fit on training data
     fit <- tryCatch({
-      glmer(formula_obj, data = train_data, family = binomial,
-            control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+      if (model_fn == "glmmTMB") {
+        glmmTMB(formula_obj, data = train_data, family = binomial(link = "logit"))
+      } else {
+        glmer(formula_obj, data = train_data, family = binomial,
+              control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 1e5)))
+      }
     }, error = function(e) NULL)
 
     if (is.null(fit)) {
@@ -209,12 +380,20 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
       next
     }
 
-    converged <- is.null(fit@optinfo$conv$lme4$messages)
+    # Check convergence
+    converged <- if (model_fn == "glmmTMB") {
+      is.null(fit$fit$convergence) || fit$fit$convergence == 0
+    } else {
+      is.null(fit@optinfo$conv$lme4$messages)
+    }
 
-    # Conditional predictions (facilities are known)
+    # Conditional predictions (facilities are known in time-series CV)
     p_event <- tryCatch({
-      predict(fit, newdata = test_data, type = "response",
-              allow.new.levels = TRUE)
+      if (model_fn == "glmmTMB") {
+        predict(fit, newdata = test_data, type = "response", allow.new.levels = TRUE)
+      } else {
+        predict(fit, newdata = test_data, type = "response", allow.new.levels = TRUE)
+      }
     }, error = function(e) NULL)
 
     if (is.null(p_event)) {
@@ -222,7 +401,7 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
       next
     }
 
-    metrics <- compute_binary_metrics(test_data$scram_binary, p_event)
+    metrics <- compute_binary_metrics(test_data[[outcome_var]], p_event)
 
     fold_results[[i]] <- tibble(
       fold            = i,
@@ -230,6 +409,8 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
       status          = ifelse(converged, "success", "convergence_warning"),
       n_train         = nrow(train_data),
       n_test          = nrow(test_data),
+      n_train_fac     = n_distinct(train_data$facility),
+      n_test_fac      = n_distinct(test_data$facility),
       brier_score     = metrics$brier_score,
       log_loss        = metrics$log_loss,
       auc_roc         = metrics$auc_roc,
@@ -247,11 +428,11 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
 
   summary_row <- successful %>%
     summarise(
-      brier_mean   = mean(brier_score, na.rm = TRUE),
-      brier_sd     = sd(brier_score, na.rm = TRUE),
-      auc_mean     = mean(auc_roc, na.rm = TRUE),
-      logloss_mean = mean(log_loss, na.rm = TRUE),
-      n_folds      = n(),
+      brier_score_mean = mean(brier_score, na.rm = TRUE),
+      brier_score_sd   = sd(brier_score, na.rm = TRUE),
+      auc_roc_mean     = mean(auc_roc, na.rm = TRUE),
+      log_loss_mean    = mean(log_loss, na.rm = TRUE),
+      n_folds          = n(),
       .groups = "drop"
     ) %>%
     mutate(model_label = model_label, cv_strategy = "timeseries")
@@ -261,39 +442,66 @@ cv_timeseries <- function(data, formula_obj, model_label = "full",
 
 
 # ==============================================================================
-# CV WITH BASELINES: Run all model variants for a single climate var
+# CV WITH BASELINES: Run all model variants for a single climate var + outcome
 # ==============================================================================
 
-#' Run CV for full model + baselines for one climate variable
+#' Run CV for full model + baselines for one climate variable and outcome
 #'
 #' Models compared:
-#'   1. intercept_only: scram ~ 1 + (1|facility)
-#'   2. seasonal_ops:   scram ~ year + ops + (1|facility)
-#'   3. full:           scram ~ year + ops + climate + (1|facility)
+#'   1. intercept_only: outcome ~ 1 + (1|facility)
+#'   2. seasonal_ops:   outcome ~ temporal + ops + (1|facility)
+#'   3. full:           outcome ~ temporal + ops + climate + (1|facility)
+#'
+#' For hurdle outcomes, CV evaluates the binary gate (did event occur?)
+#' using Brier, AUC, log-loss — same metrics as binary outcomes.
 #'
 #' @param data Prepared data frame
 #' @param climate_var Climate variable name
+#' @param outcome Outcome name (e.g., "power_loss_pct", "emerg_binary")
 #' @param K Folds for group k-fold
 #' @param min_train_years Min years for time-series CV
 #' @return Tibble with one row per model × strategy
-cv_with_baselines <- function(data, climate_var, K = 5, min_train_years = 5) {
+cv_with_baselines <- function(data, climate_var, outcome = "emerg_binary",
+                              K = 5, min_train_years = 5) {
 
-  fml_full      <- build_binary_formula(climate_var)
-  fml_seasonal  <- build_seasonal_formula()
-  fml_intercept <- build_intercept_formula()
+  # Get outcome-specific settings
+  outcome_var <- get_cv_outcome_var(outcome)
+  model_fn    <- get_cv_model_fn(outcome)
 
-  models <- list(
-    list(fml = fml_intercept, label = "intercept_only"),
-    list(fml = fml_seasonal,  label = "seasonal_ops"),
-    list(fml = fml_full,      label = "full")
-  )
+  # Build the three formula variants
+  models <- build_cv_formulas(outcome, climate_var)
+
+  # Filter to complete cases for this outcome
+  data <- data %>%
+    filter(
+      !is.na(.data[[outcome_var]]),
+      !is.na(.data[[climate_var]]),
+      !is.na(yearmonth_num_c)
+    )
+
+  # Also require ops covariates
+  ops_cols <- grep("_(between|within)$", names(data), value = TRUE)
+  if (length(ops_cols) > 0) {
+    for (col in ops_cols) {
+      data <- data %>% filter(!is.na(.data[[col]]))
+    }
+  }
+
+  if (nrow(data) < 100) {
+    return(tibble(
+      climate_var = climate_var, outcome = outcome,
+      model_label = "insufficient_data", cv_strategy = NA,
+      brier_mean = NA, n_obs = nrow(data)
+    ))
+  }
 
   all_summaries <- list()
 
   for (m in models) {
     # Strategy A: Group K-Fold
     res_gkf <- tryCatch({
-      cv_group_kfold(data, m$fml, model_label = m$label, K = K)
+      cv_group_kfold(data, m$fml, model_label = m$label, K = K,
+                     outcome_var = outcome_var, model_fn = model_fn)
     }, error = function(e) list(summary = NULL))
 
     if (!is.null(res_gkf$summary)) {
@@ -303,7 +511,8 @@ cv_with_baselines <- function(data, climate_var, K = 5, min_train_years = 5) {
     # Strategy B: Time-Series
     res_ts <- tryCatch({
       cv_timeseries(data, m$fml, model_label = m$label,
-                     min_train_years = min_train_years)
+                    min_train_years = min_train_years,
+                    outcome_var = outcome_var, model_fn = model_fn)
     }, error = function(e) list(summary = NULL))
 
     if (!is.null(res_ts$summary)) {
@@ -314,31 +523,33 @@ cv_with_baselines <- function(data, climate_var, K = 5, min_train_years = 5) {
   if (length(all_summaries) == 0) return(NULL)
 
   bind_rows(all_summaries) %>%
-    mutate(climate_var = climate_var)
+    mutate(climate_var = climate_var, climate_var_tested = climate_var, outcome = outcome)
 }
 
 
 # ==============================================================================
-# ANALYZE SINGLE CONFIGURATION (all climate vars × CV)
+# ANALYZE SINGLE CONFIGURATION (all outcomes × climate vars × CV)
 # ==============================================================================
 
-#' Run CV for a single NRC configuration
+#' Run CV for a single NRC configuration across all outcomes
 #'
 #' @param parquet_path Path to config parquet
 #' @param config_id Configuration ID
 #' @param nrc_events Event metadata
 #' @param ops_features Operational features
+#' @param outcomes Character vector of outcomes to CV
 #' @param K Folds for group k-fold
 #' @param min_train_years Min years for time-series CV
 #' @param min_reports Min events per facility
 #' @return Tibble of CV results for this config
 cv_single_config_nrc <- function(parquet_path, config_id, nrc_events,
-                                  ops_features = NULL,
-                                  K = 5, min_train_years = 5,
-                                  min_reports = 20) {
+                                 ops_features = NULL,
+                                 outcomes = c("power_loss_pct", "emerg_binary"),
+                                 K = 5, min_train_years = 5,
+                                 min_reports = 75) {
 
   df <- prepare_nrc_config_data(parquet_path, config_id, nrc_events,
-                                 ops_features, min_reports = min_reports)
+                                ops_features, min_reports = min_reports)
 
   if (is.null(df) || nrow(df) == 0) {
     return(tibble(config_id = config_id, status = "no_data"))
@@ -349,20 +560,36 @@ cv_single_config_nrc <- function(parquet_path, config_id, nrc_events,
     return(tibble(config_id = config_id, status = "no_climate_vars"))
   }
 
-  # Run CV for each climate variable
-  cv_results <- map(climate_vars, function(cvar) {
-    res <- tryCatch({
-      cv_with_baselines(df, cvar, K = K, min_train_years = min_train_years)
-    }, error = function(e) {
-      tibble(climate_var = cvar, model_label = "error",
-             cv_strategy = NA, brier_mean = NA, error = as.character(e$message))
-    })
+  # Run CV for each outcome × climate variable
+  cv_results <- list()
 
-    if (!is.null(res)) {
-      res$config_id <- config_id
+  for (outcome in outcomes) {
+    # Check if this outcome's family supports binary CV
+    outcome_family <- tryCatch(
+      get_outcome_config(outcome)$family,
+      error = function(e) "unknown"
+    )
+    if (!outcome_family %in% c("binomial", "hurdle")) {
+      warning(sprintf("  Config %s: skipping '%s' — CV not supported for family '%s'",
+                      config_id, outcome, outcome_family))
+      next
     }
-    return(res)
-  })
+
+    for (cvar in climate_vars) {
+      res <- tryCatch({
+        cv_with_baselines(df, cvar, outcome = outcome,
+                          K = K, min_train_years = min_train_years)
+      }, error = function(e) {
+        tibble(climate_var = cvar, outcome = outcome, model_label = "error",
+               cv_strategy = NA, brier_mean = NA, error = as.character(e$message))
+      })
+
+      if (!is.null(res)) {
+        res$config_id <- config_id
+        cv_results <- c(cv_results, list(res))
+      }
+    }
+  }
 
   bind_rows(cv_results)
 }
@@ -377,21 +604,48 @@ cv_single_config_nrc <- function(parquet_path, config_id, nrc_events,
 #' @param cfg_dir Directory with config parquet files
 #' @param nrc_events Event metadata
 #' @param ops_features Operational features
-#' @param n_workers Parallel workers
+#' @param config_ids Config IDs to run (NULL = all)
+#' @param outcomes Character vector of outcomes to CV
+#' @param n_workers Parallel workers (also accepts n_cores for rail consistency)
 #' @param K Group k-fold K
-#' @param min_train_years Time-series min training years
+#' @param min_train_years Time-series min training years (NRC uses year-based
+#'   expanding window; rail-style n_splits/test_duration_months/gap_months are
+#'   not applicable because NRC events are sparse and year-level granularity
+#'   is more appropriate)
 #' @param output_path Output parquet path
 #' @param checkpoint_dir Directory for per-config checkpoints
 #' @param min_reports Min events per facility
+#' @param seed Random seed for fold assignment
+#' @param n_cores Alias for n_workers (for consistency with rail CV interface)
+#' @param ... Additional arguments (absorbed silently for cross-industry compatibility,
+#'   e.g. n_splits, test_duration_months, gap_months from rail CV calls)
 #' @return Data frame of all CV results
 run_nrc_cv <- function(cfg_dir, nrc_events, ops_features = NULL,
-                        config_ids = NULL,
-                        n_workers = 4L, K = 5, min_train_years = 5,
-                        output_path = "results/nrc/nrc_cv_results.parquet",
-                        checkpoint_dir = "results/nrc/cv_checkpoints",
-                        min_reports = 20) {
+                       config_ids = NULL,
+                       outcomes = c("power_loss_pct", "emerg_binary", "ordinal_scram"),
+                       n_workers = NULL, K = 5, min_train_years = 5,
+                       output_path = "results/nrc/nrc_cv_results.parquet",
+                       checkpoint_dir = "results/nrc/cv_checkpoints",
+                       min_reports = 75,
+                       seed = 42,
+                       n_cores = NULL,
+                       ...) {
 
-  # Discover configurations — same structure as rail: cfg_dir/_cfg/{id}/results.parquet
+  # Handle n_cores / n_workers aliasing
+  if (!is.null(n_cores) && is.null(n_workers)) {
+    n_workers <- n_cores
+  }
+  if (is.null(n_workers)) n_workers <- 4L
+
+  # Warn about unused rail-specific params if passed
+  dots <- list(...)
+  rail_params <- intersect(names(dots), c("n_splits", "test_duration_months", "gap_months"))
+  if (length(rail_params) > 0) {
+    message(sprintf("Note: %s ignored for NRC CV (uses year-based expanding window via min_train_years=%d instead)",
+                    paste(rail_params, collapse = ", "), min_train_years))
+  }
+
+  # Discover configurations
   if (is.null(config_ids)) {
     cfg_path <- file.path(cfg_dir, "_cfg")
     if (!dir.exists(cfg_path)) {
@@ -410,6 +664,7 @@ run_nrc_cv <- function(cfg_dir, nrc_events, ops_features = NULL,
 
   cat(sprintf("NRC CV: %d configs total, %d already done, %d remaining\n",
               length(config_ids), length(completed), length(todo_ids)))
+  cat(sprintf("  Outcomes: %s\n", paste(outcomes, collapse = ", ")))
 
   if (length(todo_ids) == 0) {
     cat("All configs complete — loading from checkpoints\n")
@@ -440,6 +695,7 @@ run_nrc_cv <- function(cfg_dir, nrc_events, ops_features = NULL,
         config_id    = cfg_id,
         nrc_events   = nrc_events,
         ops_features = ops_features,
+        outcomes     = outcomes,
         K = K,
         min_train_years = min_train_years,
         min_reports = min_reports
@@ -453,40 +709,62 @@ run_nrc_cv <- function(cfg_dir, nrc_events, ops_features = NULL,
 
   }, .options = furrr_options(
     seed = TRUE,
-    packages = c("tidyverse", "lme4", "pROC", "arrow", "glue", "slider"),
-    globals = list(
-      cfg_dir = cfg_dir,
-      nrc_events = nrc_events,
-      ops_features = ops_features,
-      K = K,
-      min_train_years = min_train_years,
-      min_reports = min_reports,
-      WINDOW_SPECS = WINDOW_SPECS,
-      MODEL_FORMULAS = MODEL_FORMULAS,
-      MODEL_FORMULAS_NO_CLIMATE = MODEL_FORMULAS_NO_CLIMATE,
-      MODEL_FORMULAS_INTERCEPT = MODEL_FORMULAS_INTERCEPT,
-      MODEL_FORMULAS_SEASONAL = MODEL_FORMULAS_SEASONAL,
-      NRC_OPS_VARS = NRC_OPS_VARS,
-      NRC_OPS_LAG_K = NRC_OPS_LAG_K,
-      NRC_OPS_ROLL_K = NRC_OPS_ROLL_K,
-      NRC_OPS_MIN_HIST = NRC_OPS_MIN_HIST,
-      OUTCOME_VARS = OUTCOME_VARS,
-      cv_single_config_nrc = cv_single_config_nrc,
-      prepare_nrc_config_data = prepare_nrc_config_data,
-      create_all_windows = create_all_windows,
-      ewma_time_decay_irregular_lag = ewma_time_decay_irregular_lag,
-      join_nrc_ops = join_nrc_ops,
-      get_climate_vars = get_climate_vars,
-      get_outcome_config = get_outcome_config,
-      build_formula = build_formula,
-      build_binary_formula = build_binary_formula,
-      build_intercept_formula = build_intercept_formula,
-      build_seasonal_formula = build_seasonal_formula,
-      cv_with_baselines = cv_with_baselines,
-      cv_group_kfold = cv_group_kfold,
-      cv_timeseries = cv_timeseries,
-      compute_binary_metrics = compute_binary_metrics
-    )
+    packages = c("tidyverse", "lme4", "glmmTMB", "pROC", "broom.mixed",
+                 "arrow", "glue", "slider"),
+    globals = {
+      # Build globals list dynamically — only include objects that exist
+      # Use globalenv() because parent.frame() inside furrr_options resolves
+      # to the wrong scope and misses sourced functions
+      env <- globalenv()
+
+      candidate_globals <- list(
+        # Data
+        cfg_dir = cfg_dir,
+        nrc_events = nrc_events,
+        ops_features = ops_features,
+        outcomes = outcomes,
+        K = K,
+        min_train_years = min_train_years,
+        min_reports = min_reports
+      )
+
+      # Config constants — include if they exist in the global environment
+      config_vars <- c("WINDOW_SPECS", "MODEL_FORMULAS", "MODEL_FORMULAS_NO_CLIMATE",
+                       "MODEL_FORMULAS_INTERCEPT", "MODEL_FORMULAS_SEASONAL",
+                       "NRC_OPS_VARS", "NRC_OPS_LAG_K", "NRC_OPS_ROLL_K",
+                       "NRC_OPS_MIN_HIST", "OUTCOME_VARS", "MIN_REPORTS_DEFAULT")
+      for (v in config_vars) {
+        if (exists(v, envir = env)) {
+          candidate_globals[[v]] <- get(v, envir = env)
+        }
+      }
+
+      # Functions — include if they exist in the global environment
+      fn_names <- c("cv_single_config_nrc", "prepare_nrc_config_data",
+                    "create_all_windows", "encode_nrc_outcomes", "join_nrc_ops",
+                    "get_climate_vars", "get_outcome_config", "get_cv_outcome_var",
+                    "get_cv_model_fn", "build_formula", "build_outcome_formula",
+                    "build_intercept_formula", "build_seasonal_formula",
+                    "build_cv_formulas", "cv_with_baselines", "cv_group_kfold",
+                    "cv_timeseries", "compute_binary_metrics", "compute_gamma_metrics",
+                    "ewma_time_decay_irregular_lag", "make_ops_features_rolling")
+      for (fn in fn_names) {
+        if (exists(fn, envir = env)) {
+          candidate_globals[[fn]] <- get(fn, envir = env)
+        }
+      }
+
+      # Report what was found vs missing for debugging
+      found_fns <- fn_names[sapply(fn_names, function(fn) exists(fn, envir = env))]
+      missing_fns <- setdiff(fn_names, found_fns)
+      if (length(missing_fns) > 0) {
+        warning(sprintf("NRC CV globals: %d functions found, %d missing: %s",
+                        length(found_fns), length(missing_fns),
+                        paste(missing_fns, collapse = ", ")))
+      }
+
+      candidate_globals
+    }
   ), .progress = TRUE)
 
   elapsed <- difftime(Sys.time(), start_time, units = "mins")
@@ -527,6 +805,7 @@ run_nrc_cv <- function(cfg_dir, nrc_events, ops_features = NULL,
 #   cfg_dir      = "data/processed/nrc/configs",
 #   nrc_events   = nrc_events,
 #   ops_features = ops_features,
+#   outcomes     = c("power_loss_pct", "emerg_binary"),
 #   n_workers    = 8L,
 #   K            = 5,
 #   output_path  = "results/nrc/nrc_cv_results.parquet"
