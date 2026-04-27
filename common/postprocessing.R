@@ -248,7 +248,8 @@ plot_spec_curve <- function(df, outcome_filter = NULL, component = NULL,
 plot_spec_curve_with_panels <- function(df, outcome_filter = NULL,
                                          component = NULL,
                                          decision_vars = NULL,
-                                         sort_by = "estimate") {
+                                         sort_by = "estimate",
+                                         plot_subtitle = NULL) {
 
   # Default decision vars — auto-detect what's available
   if (is.null(decision_vars)) {
@@ -290,6 +291,12 @@ plot_spec_curve_with_panels <- function(df, outcome_filter = NULL,
   # Remove the x-axis from the main curve (shared with panels below)
   p_top <- curve_result$curve +
     theme(axis.text.x = element_blank(), axis.title.x = element_blank())
+
+  if (!is.null(plot_subtitle)) {
+    p_top <- p_top + labs(subtitle = plot_subtitle) +
+      theme(plot.subtitle = element_text(color = "#2166ac", face = "italic",
+                                         size = PLOT_SUBTITLE_SIZE))
+  }
 
   # Create colored tile strip for each decision variable
   panel_plots <- map(decision_vars, function(var) {
@@ -977,18 +984,39 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
 #' @param cv_results CV results tibble
 #' @param cv_strategy "group_kfold" or "timeseries"
 #' @return ggplot object
-plot_delta_brier <- function(cv_results, cv_strategy = "group_kfold") {
+plot_delta_brier <- function(cv_results, cv_strategy = "group_kfold",
+                             baseline_label = NULL) {
 
   cv_results <- normalize_cv_columns(cv_results)
 
-  df <- cv_results %>%
+  # Auto-detect baseline if not specified: prefer no_climate > seasonal_ops > first non-full
+  if (is.null(baseline_label)) {
+    available <- setdiff(unique(cv_results$model_label), "full")
+    preferred <- c("no_climate", "seasonal_ops", "best_non_climate")
+    baseline_label <- preferred[preferred %in% available][1]
+    if (is.na(baseline_label)) baseline_label <- available[1]
+  }
+
+  if (is.na(baseline_label) || is.null(baseline_label)) {
+    message("Cannot compute delta-Brier: no non-full baseline found")
+    return(NULL)
+  }
+
+  df_strat <- cv_results %>%
     filter(cv_strategy == !!cv_strategy, !is.na(brier_mean)) %>%
-    filter(model_label %in% c("full", "seasonal_ops")) %>%
+    filter(model_label %in% c("full", baseline_label)) %>%
     select(config_id, climate_var, model_label, brier_mean) %>%
     pivot_wider(names_from = model_label, values_from = brier_mean,
-                id_cols = c(config_id, climate_var)) %>%
-    filter(!is.na(full), !is.na(seasonal_ops)) %>%
-    mutate(delta_brier = full - seasonal_ops) %>%
+                id_cols = c(config_id, climate_var))
+
+  if (!all(c("full", baseline_label) %in% names(df_strat))) {
+    message("Cannot compute delta-Brier: missing 'full' or '", baseline_label, "' after pivot")
+    return(NULL)
+  }
+
+  df <- df_strat %>%
+    filter(!is.na(.data[["full"]]), !is.na(.data[[baseline_label]])) %>%
+    mutate(delta_brier = .data[["full"]] - .data[[baseline_label]]) %>%
     arrange(delta_brier) %>%
     mutate(spec_rank = row_number())
 
@@ -999,6 +1027,7 @@ plot_delta_brier <- function(cv_results, cv_strategy = "group_kfold") {
 
   n_better <- sum(df$delta_brier < 0)
   n_total  <- nrow(df)
+  baseline_display <- gsub("_", " ", baseline_label)
 
   ggplot(df, aes(x = spec_rank, y = delta_brier)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
@@ -1009,7 +1038,8 @@ plot_delta_brier <- function(cv_results, cv_strategy = "group_kfold") {
       name = NULL
     ) +
     labs(x = "Specification (ordered)", y = "Delta Brier (negative = better)",
-         title = "Delta-Brier: Full Model - Seasonal+Ops Baseline",
+         title = sprintf("Delta-Brier: Full Model vs. %s baseline",
+                         tools::toTitleCase(baseline_display)),
          subtitle = sprintf("%d/%d specifications improved by climate", n_better, n_total)) +
     theme_minimal(base_size = PLOT_BASE_SIZE) +
     theme(legend.position = "top")
@@ -1072,11 +1102,13 @@ build_cross_industry_robustness <- function(figure_dir, industry_labels = NULL) 
 
     map_dfr(rob_files, function(f) {
       rob <- read_csv(f, show_col_types = FALSE)
-      # Parse outcome and component from filename
       fname <- tools::file_path_sans_ext(basename(f))
       fname <- sub("_robustness$", "", fname)
 
-      # Split: outcome_component or just outcome
+      # Detect filtered files and strip the _filtered tag for outcome/component parsing
+      is_filtered <- grepl("_filtered", fname)
+      if (is_filtered) fname <- sub("_filtered", "", fname)
+
       if (grepl("_(cond|zi)$", fname)) {
         component <- sub(".*_(cond|zi)$", "\\1", fname)
         outcome <- sub("_(cond|zi)$", "", fname)
@@ -1090,7 +1122,8 @@ build_cross_industry_robustness <- function(figure_dir, industry_labels = NULL) 
           industry = ind,
           industry_label = if (!is.null(industry_labels)) industry_labels[ind] %||% ind else ind,
           outcome = outcome,
-          component = component
+          component = component,
+          specification_set = if (is_filtered) "CV-Filtered" else "All"
         )
     })
   })
@@ -1110,10 +1143,10 @@ build_cross_industry_robustness <- function(figure_dir, industry_labels = NULL) 
         TRUE                  ~ component
       )
     ) %>%
-    select(industry_label, outcome_label, component_label,
+    select(industry_label, outcome_label, component_label, specification_set,
            n_models, mean_estimate, sd_estimate, median_estimate,
            pct_significant, pct_negative, pct_neg_sig) %>%
-    arrange(industry_label, outcome_label, desc(component_label))
+    arrange(industry_label, outcome_label, specification_set, desc(component_label))
 }
 
 
@@ -1135,6 +1168,7 @@ build_cross_industry_importance <- function(figure_dir, industry_labels = NULL) 
     imp_files <- list.files(file.path(figure_dir, ind),
                             pattern = "_config_importance\\.csv$",
                             full.names = TRUE)
+    imp_files <- imp_files[!grepl("_filtered_|_filtered\\.csv$", basename(imp_files))]
     if (length(imp_files) == 0) return(NULL)
 
     map_dfr(imp_files, function(f) {
@@ -1300,16 +1334,18 @@ plot_cross_industry_climate_vs_ops <- function(industries, industry_labels = NUL
     )
     if (is.null(mv_results)) return(NULL)
 
-    # Apply CV filtering if provided for this industry
-    # Pair-level takes precedence over config-level
+    # Apply CV filtering if provided for this industry.
+    # Coerce config_id to character to handle integer/character type mismatches
+    # between parquet sources and the credible_pairs/configs vectors.
+    mv_results <- mv_results %>% mutate(config_id = as.character(config_id))
     if (!is.null(credible_pairs) && ind_key %in% names(credible_pairs)) {
-      pairs <- credible_pairs[[ind_key]]
+      pairs <- credible_pairs[[ind_key]] %>% mutate(config_id = as.character(config_id))
       mv_results <- mv_results %>%
         inner_join(pairs, by = c("config_id" = "config_id",
                                   "climate_var" = "climate_var_tested"))
     } else if (!is.null(credible_configs) && ind_key %in% names(credible_configs)) {
       mv_results <- mv_results %>%
-        filter(config_id %in% credible_configs[[ind_key]])
+        filter(config_id %in% as.character(credible_configs[[ind_key]]))
     }
 
     results_full <- link_results_to_config(mv_results, ind$config_registry)

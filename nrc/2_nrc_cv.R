@@ -19,9 +19,9 @@ cv_results <- run_cv(
   events_df = nrc_events,
   ops_features = ops_features,
   n_workers = 10L,
-  output_path = "results_new/nrc/cv_results.parquet",
-  checkpoint_dir = "results_new/nrc/cv_checkpoints",
-  config_ids = c(1,2,3,4,5,6,7,8,9,10)
+  output_path = "results_new_new/nrc/cv_results.parquet",
+  checkpoint_dir = "results_new_new/nrc/cv_checkpoints",
+  config_ids = NULL #c(1,2,3,4,5,6,7,8,9,10)
 )
 
 # t <- arrow::read_parquet("results_new/nrc/cv_results.parquet")

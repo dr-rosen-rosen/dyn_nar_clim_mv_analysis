@@ -221,7 +221,8 @@ save_figure <- function(plot, industry_dir, outcome, component, figure_type,
 #' @param component_label Label for title
 #' @return ggplot object
 plot_config_importance_bar <- function(importance_df, outcome_label = "",
-                                       component_label = "") {
+                                       component_label = "",
+                                       plot_subtitle = NULL) {
   if (is.null(importance_df) || nrow(importance_df) == 0) return(NULL)
 
   plot_data <- importance_df %>%
@@ -234,6 +235,9 @@ plot_config_importance_bar <- function(importance_df, outcome_label = "",
       var_label = fct_reorder(var_label, pct_variance)
     )
 
+  subtitle_text <- plot_subtitle %||%
+    "% variance in climate effect explained by each analytical choice (univariate R\u00b2)"
+
   ggplot(plot_data, aes(x = var_label, y = pct_variance, fill = pct_variance)) +
     geom_col(alpha = 0.85, show.legend = FALSE) +
     geom_text(aes(label = paste0(sprintf("%.1f", pct_variance), "% ", significance)),
@@ -243,12 +247,19 @@ plot_config_importance_bar <- function(importance_df, outcome_label = "",
     scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
     labs(
       title = paste0("Configuration Importance: ", outcome_label, " ", component_label),
-      subtitle = "% variance in climate effect explained by each analytical choice (univariate R²)",
+      subtitle = subtitle_text,
       x = NULL,
       y = "% Variance Explained"
     ) +
     theme_minimal(base_size = 11) +
-    theme(panel.grid.major.y = element_blank())
+    theme(
+      panel.grid.major.y = element_blank(),
+      plot.subtitle = if (!is.null(plot_subtitle)) {
+        element_text(color = "#2166ac", face = "italic")
+      } else {
+        element_text()
+      }
+    )
 }
 
 
@@ -269,6 +280,15 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
 
   industry_dir <- file.path(output_dir, industry_key)
   dir.create(industry_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # Remove stale figures and CSVs from previous runs before generating new ones.
+  # This prevents accumulation of files with old outcome names, old filter settings,
+  # or old component labels that would corrupt the manifest and cross-industry tables.
+  stale <- list.files(industry_dir, pattern = "\\.(pdf|csv)$", full.names = TRUE)
+  if (length(stale) > 0) {
+    file.remove(stale)
+    if (verbose) message(sprintf("  Cleaned %d stale file(s) from %s", length(stale), industry_dir))
+  }
 
   label <- ind_config$label %||% toupper(industry_key)
 
@@ -304,9 +324,19 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
   results_filtered <- NULL
   if (!is.null(ind_config$cv_filter_baseline) && !is.null(cv_results)) {
     if (!exists("filter_credible_specs", mode = "function")) {
-      warning("cv_filter_baseline is set but filter_credible_specs() not found. ",
-              "Source configuration_concordance.R first. Skipping CV filtering.")
-    } else {
+      # Try to auto-source configuration_concordance.R from the common/ directory.
+      concordance_path <- file.path(
+        dirname(normalizePath("common/generate_mv_report.R", mustWork = FALSE)),
+        "configuration_concordance.R"
+      )
+      if (file.exists(concordance_path)) {
+        source(concordance_path, local = FALSE)
+      } else {
+        warning("cv_filter_baseline is set but filter_credible_specs() not found. ",
+                "Source common/configuration_concordance.R first. Skipping CV filtering.")
+      }
+    }
+    if (exists("filter_credible_specs", mode = "function")) {
       if (verbose) message(sprintf("  CV pre-filtering (baseline: %s, require both: %s, level: %s)...",
                                    ind_config$cv_filter_baseline,
                                    ind_config$cv_filter_require_both,
@@ -321,15 +351,19 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
 
       # Apply filtering based on filter_level
       if ((ind_config$cv_filter_level %||% "config_window") == "config_window") {
-        # Pair-level: only retain specific config × climate_var combinations
-        credible_pairs <- cv_filter_result$credible_pairs
+        # Pair-level: only retain specific config × climate_var combinations.
+        # Coerce config_id to character to match results_full (link_results_to_config
+        # always produces character config_id; CV parquet may store it as integer).
+        credible_pairs <- cv_filter_result$credible_pairs %>%
+          mutate(config_id = as.character(config_id))
         results_filtered <- results_full %>%
           inner_join(credible_pairs,
                      by = c("config_id" = "config_id",
                             "climate_var" = "climate_var_tested"))
       } else {
         # Config-level: retain all windows for any config with at least one good window
-        results_filtered <- results_full %>% filter(config_id %in% credible_ids)
+        results_filtered <- results_full %>%
+          filter(config_id %in% as.character(credible_ids))
       }
 
       if (verbose) {
@@ -391,6 +425,13 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
         names(components_to_plot) <- ordered_types
       }
 
+      # Banner added to plot subtitle when generating filtered figures
+      filter_banner <- if (suffix_label != "") {
+        "CV-Filtered \u2014 only specifications where climate improves out-of-sample prediction"
+      } else {
+        NULL
+      }
+
       for (comp_name in names(components_to_plot)) {
         comp <- components_to_plot[[comp_name]]
         comp_label <- if (is.null(comp)) "" else ifelse(comp == "cond", "(Conditional)", "(Zero-Inflation)")
@@ -404,7 +445,8 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
                               c("window_type", "embedding_model", "sent_method", "comp__method"))
           p_spec <- plot_spec_curve_with_panels(
             results_data, outcome_filter = outcome, component = comp,
-            decision_vars = ind_config$decision_vars
+            decision_vars = ind_config$decision_vars,
+            plot_subtitle = filter_banner
           )
           dims <- figure_dims("spec_curve", n_panels)
           local_idx <- local_idx + 1
@@ -436,7 +478,8 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
           p_importance <- plot_config_importance_bar(
             importance_df,
             outcome_label = tools::toTitleCase(outcome),
-            component_label = comp_label
+            component_label = comp_label,
+            plot_subtitle = filter_banner
           )
           dims <- figure_dims("config_importance")
           local_idx <- local_idx + 1
@@ -455,6 +498,10 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
             results_data, ops_vars = ind_config$ops_vars,
             outcome_filter = outcome, component = comp
           )
+          if (!is.null(filter_banner) && !is.null(result$plot)) {
+            result$plot <- result$plot + labs(subtitle = filter_banner) +
+              theme(plot.subtitle = element_text(color = "#2166ac", face = "italic"))
+          }
           dims <- figure_dims("climate_vs_ops")
           local_idx <- local_idx + 1
           local_rows[[local_idx]] <- save_figure(
@@ -679,10 +726,13 @@ generate_mv_figures <- function(industries, output_dir = "report_figures",
       cred_path <- file.path(output_dir, ind_key, "cv_credible_configs.csv")
       pairs_path <- file.path(output_dir, ind_key, "cv_credible_pairs.csv")
       if (file.exists(cred_path)) {
-        credible_by_industry[[ind_key]] <- read_csv(cred_path, show_col_types = FALSE)$config_id
+        credible_by_industry[[ind_key]] <- as.character(
+          read_csv(cred_path, show_col_types = FALSE)$config_id
+        )
       }
       if (file.exists(pairs_path)) {
-        credible_pairs_by_industry[[ind_key]] <- read_csv(pairs_path, show_col_types = FALSE)
+        credible_pairs_by_industry[[ind_key]] <- read_csv(pairs_path, show_col_types = FALSE) %>%
+          mutate(config_id = as.character(config_id))
       }
     }
 

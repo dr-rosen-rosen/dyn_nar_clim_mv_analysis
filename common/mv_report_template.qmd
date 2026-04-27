@@ -92,15 +92,20 @@ show_robustness <- function(ind, out, comp) {
   csv_path <- file.path(figure_dir, ind, paste0(out, comp_part, "_robustness.csv"))
   if (!file.exists(csv_path)) return(invisible(NULL))
 
+  is_filtered <- grepl("_filtered$", out)
+  base_out <- sub("_filtered$", "", out)
+  out_display <- tools::toTitleCase(gsub("_", " ", base_out))
+  filter_tag <- if (is_filtered) " [CV-Filtered]" else ""
+  comp_tag <- if (comp != "single") paste0(" (", comp, ")") else ""
+
   rob <- read_csv(csv_path, show_col_types = FALSE)
   rob %>%
     mutate(across(where(is.numeric), ~round(., 2))) %>%
     kable(
       format = "latex",
       booktabs = TRUE,
-      caption = sprintf("Robustness summary: %s %s",
-                        tools::toTitleCase(gsub("_", " ", out)),
-                        if (comp != "single") paste0("(", comp, ")") else "")
+      caption = sprintf("Robustness summary: %s%s%s",
+                        out_display, comp_tag, filter_tag)
     ) %>%
     kable_styling(latex_options = c("hold_position", "scale_down"))
 }
@@ -170,11 +175,11 @@ if (has_cross && length(industries_in_manifest) >= 2) {
       kable(
         format = "latex",
         booktabs = TRUE,
-        col.names = c("Industry", "Outcome", "Component",
-                       "N Models", "Mean Est.", "SD Est.", "Median Est.",
+        col.names = c("Industry", "Outcome", "Component", "Spec. Set",
+                       "N", "Mean Est.", "SD Est.", "Median Est.",
                        "\\% Sig.", "\\% Neg.", "\\% Neg. Sig."),
         escape = FALSE,
-        caption = "Cross-industry robustness summary"
+        caption = "Cross-industry robustness summary. Spec.\\ Set: All = full multiverse; CV-Filtered = only specifications where climate improves out-of-sample prediction."
       ) %>%
       kable_styling(latex_options = c("hold_position", "scale_down"),
                     font_size = 9)
@@ -329,7 +334,14 @@ for (ind in industries_in_manifest) {
                  figure_type %in% c("spec_curve", "config_importance", "climate_vs_ops"))
 
         if (nrow(filt_for_comp) > 0) {
-          cat(sprintf("\n\n**CV-Filtered Results** *(only specifications where climate improves out-of-sample prediction)*\n\n"))
+          # Use a visually distinct subsection heading so filtered results stand out
+          filt_heading <- if (comp_label != "") {
+            sprintf("CV-Filtered Results: %s %s", out_label, comp_label)
+          } else {
+            sprintf("CV-Filtered Results: %s", out_label)
+          }
+          cat(sprintf("\n\n#### %s\n\n", filt_heading))
+          cat("*Only specifications where adding climate variables improves out-of-sample prediction (delta-Brier < 0).*\n\n")
 
           # Filtered robustness
           rob_filt <- show_robustness(ind, out_filtered, comp)
@@ -344,7 +356,7 @@ for (ind in industries_in_manifest) {
             filter(component == comp, figure_type == "spec_curve")
           if (nrow(spec_filt) > 0) {
             emit_figure(spec_filt$path[1],
-                        paste("Specification curve (CV-filtered):", out_label, comp_label))
+                        paste("Specification curve [CV-Filtered]:", out_label, comp_label))
           }
 
           # Filtered config importance
@@ -352,7 +364,7 @@ for (ind in industries_in_manifest) {
             filter(component == comp, figure_type == "config_importance")
           if (nrow(imp_filt) > 0) {
             emit_figure(imp_filt$path[1],
-                        paste("Configuration importance (CV-filtered):", out_label, comp_label),
+                        paste("Configuration importance [CV-Filtered]:", out_label, comp_label),
                         width = "0.85\\textwidth")
           }
 
@@ -361,7 +373,7 @@ for (ind in industries_in_manifest) {
             filter(component == comp, figure_type == "climate_vs_ops")
           if (nrow(ops_filt) > 0) {
             emit_figure(ops_filt$path[1],
-                        paste("Climate vs. operational effects (CV-filtered):", out_label, comp_label),
+                        paste("Climate vs. operational effects [CV-Filtered]:", out_label, comp_label),
                         width = "0.9\\textwidth")
           }
         }

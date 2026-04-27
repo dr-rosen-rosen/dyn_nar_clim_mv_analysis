@@ -2,7 +2,7 @@
 # Main script for running MV, CV, and post-processing NRC event data
 # ==============================================================================
 library(tidyverse)
-
+source('nrc/config.R')
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -93,12 +93,15 @@ protocol <- define_validation_protocol(
 # Multiverse analysis for NRC
 # ============================================================================
 source("nrc/1_nrc_multiverse.R")
+t <- arrow::read_parquet(OUTPUT_PATH)
+view(t)
+table(t$status)
+
 
 # ==============================================================================
 # Multiverse CV analysis for NRC
 # ==============================================================================
 source("nrc/2_nrc_cv.R")
-
 # cv_results <- run_nrc_cv(
 #   cfg_dir      = cfg_dir,
 #   nrc_events   = nrc_events,

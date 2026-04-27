@@ -40,11 +40,8 @@ results <- run_multiverse(
   # model_levels = c("M0", "M1"),
   n_workers = N_WORKERS,
   output_path = OUTPUT_PATH,
-  config_ids = c(1,2,3,4,5,6,7,8,9,10)
+  config_ids = NULL #c(1,2,3,4,5,6,7,8,9,10)
 )
 
-t <- arrow::read_parquet(OUTPUT_PATH)
-view(t)
-table(t$status)
 
 
