@@ -154,69 +154,6 @@ source("rail/2_rail_cv.R")
 cv <- arrow::read_parquet("results_new_new/rail/cv_results.parquet")
 skimr::skim(cv)
 view(cv)
-############ Plots
-source("common/postprocessing.R")
-source("common/generate_mv_report.R")
 
-industries <- list(
-  rail = industry_config(
-    mv_results      = "results_new/rail/mv_multiverse_results.parquet",
-    cv_results      = "results_new/rail/cv_results.parquet",
-    config_registry = here::here(cfg_dir,'config_registry.csv'),
-    label           = "Rail (FRA)",
-    decision_vars   = c("window_type", "embedding_model", "sent_method",
-                         "comp__method", "lag_days", "halflife_days"),
-    ops_vars        = c("train_miles", "passenger_miles", "staff_hours")
-  )#,
-  # nrc = industry_config(
-  #   mv_results      = "results/nrc/nrc_mv_results.parquet",
-  #   cv_results      = "results/nrc/nrc_cv_results.parquet",
-  #   config_registry = "results/nrc/config_registry.csv",
-  #   label           = "Nuclear (NRC)",
-  #   decision_vars   = c("window_type", "embedding_model", "sent_method",
-  #                        "comp__method"),
-  #   ops_vars        = c("capacity_factor", "power_std")
-  # )
-)
-
-
-# NEW APPROACH WITH LAYERS
-# # Generate everything
-generate_mv_report(industries, output_dir = "report_figures/",
-                    qmd_template = "common/mv_report_template.qmd")
-#
-# # Just regenerate figures, don't re-render
-# generate_mv_report(industries, render = FALSE)
-#
-# # Just re-render with existing figures
-# generate_mv_report(industries, regenerate_figures = FALSE)
-
-
-# Load and augment results
-source("common/postprocessing.R")
-source("common/configuration_concordance.R")
-source("common/postprocessing_layers.R")   # new
-mv <- arrow::read_parquet("results_new/rail/mv_results.parquet")
-mv <- augment_layer_facets(mv)
-mv <- link_results_to_config(mv, here::here(CFG_DIR,"config_registry.csv"))
-
-# Standard spec curve (existing function, now with layer facets available)
-all_facets <- get_all_facets(mv)
-plot_spec_curve_with_panels(mv, outcome_filter = "fatalities",
-                            decision_vars = all_facets,
-                            component = 'zi')
-
-# Layer impact: does adding temporal/EWS change the climate effect?
-compare_layer_impact(mv, outcome_filter = "fatalities",component = 'zi')
-
-# Concordance with layer facets included
-analyze_configuration_concordance(mv, metric = "climate_estimate",
-                                  facets = all_facets,
-                                  comnponent = 'zi')
-
-# CV layered delta-Brier
-cv <- arrow::read_parquet("results_new/rail/cv_results.parquet")
-deltas <- compute_layered_delta_brier(cv)
-plot_layered_delta_brier(deltas, facet_by = "comparison")
 
 
