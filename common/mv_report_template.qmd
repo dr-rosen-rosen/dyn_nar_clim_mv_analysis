@@ -19,11 +19,13 @@ format:
       - \usepackage{booktabs}
       - \usepackage{longtable}
       - \usepackage{float}
+      - \usepackage{pdflscape}
       - \floatplacement{figure}{H}
 params:
   figure_dir: "report_figures"
   manifest: "report_figures/_manifest.csv"
   industry_labels: "rail=Rail (FRA);nrc=Nuclear (NRC)"
+  track: "event"
 ---
 
 ```{r setup, include=FALSE}
@@ -107,7 +109,7 @@ show_robustness <- function(ind, out, comp) {
       caption = sprintf("Robustness summary: %s%s%s",
                         out_display, comp_tag, filter_tag)
     ) %>%
-    kable_styling(latex_options = c("hold_position", "scale_down"))
+    kable_styling(latex_options = c("hold_position"), font_size = 9)
 }
 
 # Helper: read and format config importance CSV as kable
@@ -135,7 +137,7 @@ show_importance_table <- function(ind, out, comp) {
                         tools::toTitleCase(gsub("_", " ", out)),
                         if (comp != "single") paste0("(", comp, ")") else "")
     ) %>%
-    kable_styling(latex_options = c("hold_position", "scale_down"))
+    kable_styling(latex_options = c("hold_position"), font_size = 9)
 }
 
 # Organize the manifest for iteration — exclude cross-industry summary entries
@@ -150,7 +152,7 @@ This report presents the multiverse analysis results across `r length(industries
 1. **Specification curve** -- Climate effect estimates sorted by magnitude, with decision indicator panels showing which analytical choices drive the result.
 2. **Configuration importance** -- Variance decomposition showing which analytical choices (embedding model, sentiment model, composite method, window parameters) explain the most variation in the climate effect.
 3. **Climate vs. operational comparison** -- Side-by-side effect sizes for the climate score versus operational covariates.
-4. **Cross-validation** -- Brier score specification curves and delta-Brier plots (where CV results are available).
+4. **Cross-validation** -- `r if (params$track == "panel") "Held-out log-likelihood specification curves and delta-log-lik plots" else "Brier score specification curves and delta-Brier plots"` (where CV results are available).
 
 \newpage
 
@@ -170,21 +172,23 @@ if (has_cross && length(industries_in_manifest) >= 2) {
     cat("\n\n## Robustness Comparison\n\n")
     cat("Summary of climate effect robustness across all industries, outcomes, and model components.\n\n")
 
+    cat("\\begin{landscape}\n")
     rob_tbl <- rob %>%
       mutate(across(where(is.numeric), ~round(., 2))) %>%
       kable(
         format = "latex",
         booktabs = TRUE,
+        longtable = TRUE,
         col.names = c("Industry", "Outcome", "Component", "Spec. Set",
                        "N", "Mean Est.", "SD Est.", "Median Est.",
                        "\\% Sig.", "\\% Neg.", "\\% Neg. Sig."),
         escape = FALSE,
         caption = "Cross-industry robustness summary. Spec.\\ Set: All = full multiverse; CV-Filtered = only specifications where climate improves out-of-sample prediction."
       ) %>%
-      kable_styling(latex_options = c("hold_position", "scale_down"),
-                    font_size = 9)
+      kable_styling(latex_options = c("hold_position", "repeat_header"),
+                    font_size = 10)
     print(rob_tbl)
-    cat("\n\n")
+    cat("\\end{landscape}\n\n")
   }
 
   # Config importance comparison plot
@@ -212,16 +216,20 @@ if (has_cross && length(industries_in_manifest) >= 2) {
   }
 
   if (length(ops_fig_unfiltered) > 0) {
+    cat("\\begin{landscape}\n")
     emit_figure(ops_fig_unfiltered[1],
                 "Climate vs. operational effects across industries (all specifications)",
                 width = "\\textwidth")
+    cat("\\end{landscape}\n\n")
   }
 
   if (length(ops_fig_filtered) > 0) {
     cat("\n\n**CV-Filtered** *(only specifications where climate improves out-of-sample prediction)*\n\n")
+    cat("\\begin{landscape}\n")
     emit_figure(ops_fig_filtered[1],
                 "Climate vs. operational effects across industries (CV-filtered)",
                 width = "\\textwidth")
+    cat("\\end{landscape}\n\n")
   }
 
   cat("\n\n\\newpage\n\n")
@@ -267,7 +275,8 @@ for (ind in industries_in_manifest) {
       pull(component) %>% unique()
 
     cv_components <- out_manifest %>%
-      filter(figure_type %in% c("cv_brier_spec", "delta_brier")) %>%
+      filter(figure_type %in% c("cv_brier_spec", "delta_brier",
+                                "cv_loglik_spec", "delta_loglik")) %>%
       pull(component) %>% unique()
 
     # --- MV figures per component ---
@@ -395,20 +404,24 @@ for (ind in industries_in_manifest) {
 
         cat(sprintf("\n\n#### %s\n\n", cv_label))
 
-        # Brier spec curve
+        # CV spec curve (Brier for event track, log-lik for panel track)
+        spec_type <- if (params$track == "panel") "cv_loglik_spec" else "cv_brier_spec"
+        spec_caption <- if (params$track == "panel") "CV log-likelihood:" else "CV Brier scores:"
         brier_row <- out_manifest %>%
-          filter(component == cv_comp, figure_type == "cv_brier_spec")
+          filter(component == cv_comp, figure_type == spec_type)
         if (nrow(brier_row) > 0) {
           emit_figure(brier_row$path[1],
-                      paste("CV Brier scores:", out_label, "--", cv_label))
+                      paste(spec_caption, out_label, "--", cv_label))
         }
 
-        # Delta-Brier
+        # Delta plot
+        delta_type <- if (params$track == "panel") "delta_loglik" else "delta_brier"
+        delta_caption <- if (params$track == "panel") "Delta-log-lik:" else "Delta-Brier:"
         delta_row <- out_manifest %>%
-          filter(component == cv_comp, figure_type == "delta_brier")
+          filter(component == cv_comp, figure_type == delta_type)
         if (nrow(delta_row) > 0) {
           emit_figure(delta_row$path[1],
-                      paste("Delta-Brier:", out_label, "--", cv_label))
+                      paste(delta_caption, out_label, "--", cv_label))
         }
       }
     }
@@ -419,10 +432,196 @@ for (ind in industries_in_manifest) {
 }  # end industry loop
 ```
 
+```{r champion-models-appendix, results='asis'}
+# Champion Models — single best spec per (outcome × cv_strategy), candidate
+# pool within 10% of best, and facet-level enrichment in that pool. Reads
+# CSVs written by best_model_analysis.R via generate_industry_figures().
+champ_paths <- list.files(figure_dir, pattern = "^champions_best\\.csv$",
+                           recursive = TRUE, full.names = TRUE)
+xi_path <- file.path(figure_dir, "_cross_industry",
+                     "cross_industry_champion_rollup.csv")
+if (length(champ_paths) > 0) {
+  cat("\n\n# Champion Models\n\n")
+  cat("For each industry × outcome × CV strategy, the single best ",
+      "specification (highest delta-loglik vs the seasonal+ops baseline) is ",
+      "called out. The 'candidate champion pool' includes any specification ",
+      "within 10% of the best — used to identify which analytical choices ",
+      "(embedding model, sentiment method, composite method, climate window) ",
+      "systematically appear in winning configurations.\n\n", sep = "")
+
+  # Cross-industry roll-up first — the headline summary
+  if (file.exists(xi_path)) {
+    xi <- read_csv(xi_path, show_col_types = FALSE)
+    if (nrow(xi) > 0) {
+      cat("\n\n## Cross-Industry: Dominant Facet Levels\n\n")
+      cat("Across all (industry × outcome × CV strategy) cells, this counts ",
+          "how often each level dominates the candidate-champion pool. ",
+          "High `cells_dominated` for a level suggests that choice ",
+          "systematically wins.\n\n", sep = "")
+      tbl <- xi %>%
+        kable(format = "latex", booktabs = TRUE, longtable = TRUE,
+              col.names = c("Facet", "Dominant Level", "Cells Dominated",
+                            "Total Cells", "% Dominated"),
+              caption = "Cross-industry facet dominance among candidate champions.") %>%
+        kable_styling(latex_options = c("hold_position", "repeat_header",
+                                          "scale_down"),
+                       font_size = 9)
+      print(tbl)
+      cat("\n\n")
+    }
+  }
+
+  # Per-industry: best-spec callouts + facet enrichment
+  for (cp in champ_paths) {
+    ind_key <- basename(dirname(cp))
+    ind_label <- industry_labels[ind_key] %||% toupper(ind_key)
+    best <- read_csv(cp, show_col_types = FALSE)
+    diag_path <- file.path(dirname(cp), "champions_diagnostics.csv")
+    enrich_path <- file.path(dirname(cp), "champions_facet_enrichment.csv")
+
+    cat(sprintf("\n\n## %s\n\n", ind_label))
+
+    # Best spec table — landscape because of column count.
+    # Drop best_climate_var (redundant with parsed window facets), th__method
+    # (often missing), and shorten the climate-effect columns to save space.
+    if (nrow(best) > 0) {
+      cat("\n\n### Single Best Specification\n\n")
+      cat("\\begin{landscape}\n")
+      keep_cols <- intersect(c("outcome", "cv_strategy", "best_config_id",
+                                "best_delta_ll",
+                                "climate_estimate", "climate_pval",
+                                "embedding_model", "sent_method",
+                                "comp__method",
+                                "window_type", "window_size",
+                                "lag_days", "halflife_days"),
+                              names(best))
+      best_clean <- best %>% select(any_of(keep_cols)) %>%
+        mutate(across(where(is.numeric), ~ round(., 4)))
+      tbl <- best_clean %>%
+        kable(format = "latex", booktabs = TRUE, longtable = TRUE,
+              caption = sprintf("%s: best spec per (outcome x CV strategy).",
+                                 ind_label)) %>%
+        kable_styling(latex_options = c("hold_position", "repeat_header"),
+                       font_size = 9)
+      print(tbl)
+      cat("\\end{landscape}\n\n")
+    }
+
+    # Candidate-pool diagnostics
+    if (file.exists(diag_path)) {
+      diag <- read_csv(diag_path, show_col_types = FALSE)
+      if (nrow(diag) > 0) {
+        cat("\n\n### Candidate Champion Pool Sizes\n\n")
+        diag_clean <- diag %>%
+          mutate(across(where(is.numeric), ~ round(., 4)))
+        tbl <- diag_clean %>%
+          kable(format = "latex", booktabs = TRUE,
+                caption = sprintf("%s: number of specs within 10%% of the best.",
+                                   ind_label)) %>%
+          kable_styling(latex_options = c("hold_position"), font_size = 9)
+        print(tbl)
+        cat("\n\n")
+      }
+    }
+
+    # Facet enrichment — only show meaningful ones (q < 0.1 OR |enrichment| > 1)
+    if (file.exists(enrich_path)) {
+      enrich <- read_csv(enrich_path, show_col_types = FALSE)
+      if (nrow(enrich) > 0) {
+        # Show only levels that actually appear in the candidate pool
+        # (top_n >= 1) — the absence of a level is implicit by complement,
+        # and would otherwise generate large negative-enrichment rows that
+        # mirror the positive ones.
+        flagged <- enrich %>%
+          filter(top_n >= 1L,
+                 (!is.na(q_value) & q_value < 0.10) | enrichment > 0.5) %>%
+          arrange(outcome, cv_strategy, desc(enrichment))
+
+        if (nrow(flagged) > 0) {
+          cat("\n\n### Facet Enrichment in Candidate Pool\n\n")
+          cat("Facet levels over-represented in the candidate champion pool ",
+              "relative to the full multiverse. Enrichment is ",
+              "log2(top\\_share / all\\_share); q is BH-FDR-adjusted within ",
+              "each cell. Filtered to: top\\_n $\\geq$ 1 AND ",
+              "(q $<$ 0.10 OR enrichment $>$ 0.5).\n\n", sep = "")
+          # Escape underscores in text cells (outcome/cv_strategy/facet/level
+          # contain identifiers like "rate_emerg" / "comp__method" that LaTeX
+          # would interpret as math-mode subscripts). Keep escape=FALSE for
+          # the col.names so we can use \\% etc.
+          flagged_clean <- flagged %>%
+            mutate(across(where(is.numeric), ~ round(., 4))) %>%
+            mutate(across(c(outcome, cv_strategy, facet, level),
+                          ~ gsub("_", "\\\\_", as.character(.x)))) %>%
+            select(outcome, cv_strategy, facet, level, top_n, top_share,
+                   all_share, enrichment, p_value, q_value)
+          cat("\\begin{landscape}\n")
+          tbl <- flagged_clean %>%
+            kable(format = "latex", booktabs = TRUE, longtable = TRUE,
+                  col.names = c("Outcome", "CV", "Facet", "Level",
+                                "Top n", "Top \\%", "All \\%",
+                                "Lift (log2)", "p", "q (FDR)"),
+                  escape = FALSE,
+                  caption = sprintf("%s: notable facet enrichment.",
+                                     ind_label)) %>%
+            kable_styling(latex_options = c("hold_position", "repeat_header"),
+                           font_size = 9)
+          print(tbl)
+          cat("\\end{landscape}\n\n")
+        }
+      }
+    }
+  }
+  cat("\n\n\\newpage\n\n")
+}
+```
+
+```{r model-details-appendix, results='asis'}
+# Model details appendix — populated only for panel track.
+# Reads per-industry model_details.csv (written by generate_industry_figures()
+# when track == "panel") and renders one kable per industry.
+if (params$track == "panel") {
+  md_paths <- list.files(figure_dir, pattern = "^model_details\\.csv$",
+                          recursive = TRUE, full.names = TRUE)
+  if (length(md_paths) > 0) {
+    cat("\n\n# Appendix: Model Details (Panel Track)\n\n")
+    cat("Per-outcome family choice, sample size, and (where applicable) ",
+        "Tweedie variance-power parameter $p$ across the multiverse. ",
+        "$p \\in (1, 2)$ implies a compound Poisson-Gamma; ",
+        "$p \\to 1$ leans Poisson, $p \\to 2$ leans Gamma.\n\n", sep = "")
+    for (md_path in md_paths) {
+      ind_key <- basename(dirname(md_path))
+      ind_label <- industry_labels[ind_key] %||% toupper(ind_key)
+      md <- read_csv(md_path, show_col_types = FALSE)
+
+      # Round numeric cols and drop columns that are entirely NA (e.g.
+      # tweedie_power for industries with no Tweedie outcome).
+      md_clean <- md %>%
+        mutate(across(where(is.numeric), ~ round(., 3))) %>%
+        select(where(~ !all(is.na(.))))
+
+      cat(sprintf("\n\n## %s\n\n", ind_label))
+      cat("\\begin{landscape}\n")
+      tbl <- kable(md_clean,
+                   format = "latex",
+                   booktabs = TRUE,
+                   longtable = TRUE,
+                   escape = TRUE,
+                   caption = sprintf("%s: panel-rate model details by outcome",
+                                      ind_label)) %>%
+        kable_styling(latex_options = c("hold_position", "repeat_header"),
+                      font_size = 10)
+      print(tbl)
+      cat("\\end{landscape}\n\n")
+    }
+  }
+}
+```
+
 # Appendix: Figure Manifest
 
-```{r manifest-table}
-manifest %>%
+```{r manifest-table, results='asis'}
+cat("\\begin{landscape}\n")
+manifest_tbl <- manifest %>%
   select(industry, outcome, component, figure_type, filename) %>%
   kable(
     format = "latex",
@@ -432,6 +631,8 @@ manifest %>%
   ) %>%
   kable_styling(
     latex_options = c("hold_position", "repeat_header"),
-    font_size = 8
+    font_size = 9
   )
+print(manifest_tbl)
+cat("\\end{landscape}\n")
 ```

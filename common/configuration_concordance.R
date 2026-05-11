@@ -197,12 +197,15 @@ standardize_config_facets <- function(df) {
 compute_delta_brier <- function(cv_results,
                                 baseline_strategy = c("best_non_climate",
                                                       "no_climate",
+                                                      "seasonal_ops",
                                                       "intercept_only",
-                                                      "all")) {
+                                                      "all"),
+                                track = NULL) {
 
   baseline_strategy <- match.arg(baseline_strategy)
 
-  # Harmonize column names across rail/NRC conventions
+  # Harmonize column names across rail/NRC conventions, then detect metric.
+  # detect_cv_metric() lives in postprocessing.R; if not loaded, fall back to Brier.
   cv <- cv_results
   if ("brier_mean" %in% names(cv) && !"brier_score_mean" %in% names(cv)) {
     cv <- rename(cv, brier_score_mean = brier_mean)
@@ -211,24 +214,43 @@ compute_delta_brier <- function(cv_results,
     cv <- rename(cv, climate_var_tested = climate_var)
   }
 
-  # Identify full model rows: model_label matches climate_var_tested, or == "full"
+  metric <- if (exists("detect_cv_metric", mode = "function")) {
+    # detect_cv_metric expects normalized column names; brier_score_mean -> brier_mean.
+    cv_norm <- cv
+    if ("brier_score_mean" %in% names(cv_norm) && !"brier_mean" %in% names(cv_norm)) {
+      cv_norm <- rename(cv_norm, brier_mean = brier_score_mean)
+    }
+    detect_cv_metric(cv_norm, track = track)
+  } else {
+    list(metric_col = "brier_score_mean", direction = "lower",
+         helps_op = function(d) d < 0, track = "event")
+  }
+  # If the metric is loglik, the column lives under loglik_mean (not brier_score_mean)
+  metric_col_in_cv <- if (metric$track == "panel") "loglik_mean" else "brier_score_mean"
+
+  # Drop pre-computed delta rows (panel runner emits delta_climate_vs_seasonal)
+  cv <- cv %>% filter(!grepl("^delta_", model_label))
+
+  # Identify full model rows: model_label matches climate_var_tested, == "full",
+  # or == "climate" (panel-track convention).
   cv <- cv %>%
     mutate(is_full_model = (model_label == climate_var_tested) |
-             (model_label == "full"))
+             (model_label == "full") |
+             (model_label == "climate"))
 
-  # Extract full model Brier scores
+  # Extract full model metric values
   full_models <- cv %>%
-    filter(is_full_model, !is.na(brier_score_mean)) %>%
+    filter(is_full_model, !is.na(.data[[metric_col_in_cv]])) %>%
     select(config_id, climate_var_tested, cv_strategy,
-           brier_full = brier_score_mean)
+           brier_full = all_of(metric_col_in_cv))
 
-  # Extract baseline Brier scores
+  # Extract baseline metric values
   baseline_labels <- c("intercept_only", "no_climate", "seasonal_only",
                        "seasonal_ops", "seasonal")
   baselines <- cv %>%
-    filter(model_label %in% baseline_labels, !is.na(brier_score_mean)) %>%
+    filter(model_label %in% baseline_labels, !is.na(.data[[metric_col_in_cv]])) %>%
     select(config_id, climate_var_tested, cv_strategy,
-           model_label, brier_baseline = brier_score_mean)
+           model_label, brier_baseline = all_of(metric_col_in_cv))
 
   if (baseline_strategy == "all") {
     # Return delta against every available baseline
@@ -237,21 +259,31 @@ compute_delta_brier <- function(cv_results,
                  by = c("config_id", "climate_var_tested", "cv_strategy")) %>%
       mutate(
         delta_brier = brier_full - brier_baseline,
-        climate_helps = delta_brier < 0,
+        climate_helps = metric$helps_op(delta_brier),
         baseline_used = model_label
       )
     return(delta)
   }
 
   if (baseline_strategy == "best_non_climate") {
-    # For each config, pick the baseline with the lowest Brier
-    best_baselines <- baselines %>%
-      group_by(config_id, climate_var_tested, cv_strategy) %>%
-      slice_min(brier_baseline, n = 1, with_ties = FALSE) %>%
-      ungroup()
+    # For each config, pick the strongest baseline (lowest Brier or highest loglik)
+    best_baselines <- if (metric$direction == "lower") {
+      baselines %>%
+        group_by(config_id, climate_var_tested, cv_strategy) %>%
+        slice_min(brier_baseline, n = 1, with_ties = FALSE) %>%
+        ungroup()
+    } else {
+      baselines %>%
+        group_by(config_id, climate_var_tested, cv_strategy) %>%
+        slice_max(brier_baseline, n = 1, with_ties = FALSE) %>%
+        ungroup()
+    }
   } else if (baseline_strategy == "no_climate") {
     best_baselines <- baselines %>%
       filter(model_label %in% c("no_climate", "seasonal_ops"))
+  } else if (baseline_strategy == "seasonal_ops") {
+    best_baselines <- baselines %>%
+      filter(model_label == "seasonal_ops")
   } else if (baseline_strategy == "intercept_only") {
     best_baselines <- baselines %>%
       filter(model_label == "intercept_only")
@@ -262,7 +294,7 @@ compute_delta_brier <- function(cv_results,
                by = c("config_id", "climate_var_tested", "cv_strategy")) %>%
     mutate(
       delta_brier = brier_full - brier_baseline,
-      climate_helps = delta_brier < 0,
+      climate_helps = metric$helps_op(delta_brier),
       baseline_used = model_label
     )
 
@@ -289,10 +321,27 @@ filter_credible_specs <- function(cv_results,
                                   baseline_strategy = "best_non_climate",
                                   require_both_strategies = FALSE,
                                   max_delta = 0,
-                                  filter_level = c("config_window", "config")) {
+                                  filter_level = c("config_window", "config"),
+                                  track = NULL) {
 
   filter_level <- match.arg(filter_level)
-  delta <- compute_delta_brier(cv_results, baseline_strategy)
+  delta <- compute_delta_brier(cv_results, baseline_strategy, track = track)
+
+  # `delta$climate_helps` already encodes the metric-correct direction
+  # (delta_brier < 0 for Brier, delta_loglik > 0 for log-lik).
+  # `max_delta` is interpreted in metric-natural units: for Brier the original
+  # behavior (delta_brier <= max_delta) is preserved when max_delta == 0; for
+  # log-lik we compare delta_brier >= -max_delta (i.e. climate need not strictly
+  # improve, but must not degrade by more than max_delta on the loglik scale).
+  pass_flag <- function(d) {
+    if (length(d) == 0) return(logical(0))
+    if (is.null(attr(delta, "direction"))) {
+      # Fall back to climate_helps when max_delta == 0; otherwise use raw delta
+      # against the chosen tolerance with sign inferred from the helps_op.
+      if (max_delta == 0) return(d <= 0 | (d > 0 & d <= max_delta))
+    }
+    d <= max_delta
+  }
 
   if (require_both_strategies) {
     strategies <- unique(delta$cv_strategy)
@@ -302,13 +351,20 @@ filter_credible_specs <- function(cv_results,
     }
   }
 
-  # Identify credible specs at the (config_id, climate_var) pair level
+  # Identify credible specs at the (config_id, climate_var) pair level.
+  # Use climate_helps when max_delta == 0 (the common case); otherwise
+  # interpret max_delta as a tolerance in the natural metric direction.
+  pass_predicate <- function(climate_helps_vec, delta_vec) {
+    if (max_delta == 0) climate_helps_vec
+    else climate_helps_vec | (abs(delta_vec) <= max_delta)
+  }
+
   if (require_both_strategies) {
     credible_pairs <- delta %>%
       group_by(config_id, climate_var_tested) %>%
       summarize(
         n_strategies = n_distinct(cv_strategy),
-        n_pass = sum(delta_brier <= max_delta),
+        n_pass = sum(pass_predicate(climate_helps, delta_brier), na.rm = TRUE),
         mean_delta = mean(delta_brier, na.rm = TRUE),
         .groups = "drop"
       ) %>%
@@ -318,7 +374,7 @@ filter_credible_specs <- function(cv_results,
     credible_pairs <- delta %>%
       group_by(config_id, climate_var_tested) %>%
       summarize(
-        n_pass = sum(delta_brier <= max_delta),
+        n_pass = sum(pass_predicate(climate_helps, delta_brier), na.rm = TRUE),
         mean_delta = mean(delta_brier, na.rm = TRUE),
         .groups = "drop"
       ) %>%
@@ -375,7 +431,7 @@ filter_credible_specs <- function(cv_results,
       mean_delta_brier = mean(delta_brier, na.rm = TRUE),
       min_delta_brier = min(delta_brier, na.rm = TRUE),
       max_delta_brier = max(delta_brier, na.rm = TRUE),
-      n_strategies_pass = sum(delta_brier <= max_delta),
+      n_strategies_pass = sum(pass_predicate(climate_helps, delta_brier), na.rm = TRUE),
       baseline_used = paste(unique(baseline_used), collapse = "/"),
       .groups = "drop"
     ) %>%

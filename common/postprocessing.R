@@ -58,12 +58,16 @@ detect_estimate_cols <- function(df, component = NULL) {
       style    = "rail"
     )
   } else if ("climate_estimate" %in% names(df)) {
-    # NRC ordinal: climate_estimate / climate_se / climate_p
+    # NRC ordinal / panel rate: climate_estimate / climate_se / climate_p (NRC) or
+    # climate_pval (panel). Detect which pval column is present.
+    pval_col <- if ("climate_p" %in% names(df)) "climate_p"
+                else if ("climate_pval" %in% names(df)) "climate_pval"
+                else "climate_p"  # fall back; downstream NA-handling will catch it
     list(
       estimate = "climate_estimate",
       se       = "climate_se",
-      pval     = "climate_p",
-      style    = "nrc"
+      pval     = pval_col,
+      style    = if (pval_col == "climate_pval") "panel" else "nrc"
     )
   } else {
     stop("Cannot detect estimate columns. Expected 'climate_estimate' or 'climate_estimate_cond'.")
@@ -589,7 +593,7 @@ summarize_operational_effects <- function(df, ops_vars = NULL,
       candidate <- paste0(v, suffix)
       if (candidate %in% names(df)) { est_col <- candidate; break }
     }
-    for (suffix in c("_p", paste0("_pval_", component), paste0("_p_", component))) {
+    for (suffix in c("_p", "_pval", paste0("_pval_", component), paste0("_p_", component))) {
       candidate <- paste0(v, suffix)
       if (candidate %in% names(df)) { p_col <- candidate; break }
     }
@@ -764,14 +768,71 @@ normalize_cv_columns <- function(cv_results) {
     cv_results <- cv_results %>% rename(climate_var = climate_var_tested)
   }
 
+  # Panel CV runner emits both `outcome` (the raw count column, e.g.
+  # "n_accidents") and `panel_outcome` (the rate label, e.g. "rate_accidents").
+  # Downstream code keys off `outcome`, and the panel-track multiverse output
+  # uses the rate label there too — so prefer `panel_outcome` when both exist.
+  if ("panel_outcome" %in% names(cv_results) && "outcome" %in% names(cv_results)) {
+    cv_results <- cv_results %>% mutate(outcome = panel_outcome)
+  }
+
   # Model label: rail uses climate_var name as "full" label; NRC uses "full"
   # Normalize: if model_label matches climate_var, remap to "full"
+  # Panel CV uses "climate" as the canonical full-model label — also remap to "full"
+  # so all downstream code can treat one label.
   if ("climate_var" %in% names(cv_results) && "model_label" %in% names(cv_results)) {
     cv_results <- cv_results %>%
-      mutate(model_label = ifelse(model_label == climate_var, "full", model_label))
+      mutate(model_label = ifelse(model_label == climate_var, "full", model_label),
+             model_label = ifelse(model_label == "climate", "full", model_label))
   }
 
   cv_results
+}
+
+
+#' Detect the metric column used by a CV result table.
+#'
+#' Event-level CV uses Brier scores (lower = better). Panel-rate CV uses
+#' held-out log-likelihood per observation (higher = better). This helper
+#' returns a small list describing the metric so downstream plotting and
+#' filtering code can dispatch.
+#'
+#' @param cv_results CV results tibble (post normalize_cv_columns)
+#' @param track Optional override: "event" or "panel". If NULL, auto-detected
+#'   by which metric column is present.
+#' @return list(metric_col, sd_col, direction, y_label, delta_label, helps_op,
+#'             track)
+detect_cv_metric <- function(cv_results, track = NULL) {
+  has_loglik <- "loglik_mean" %in% names(cv_results)
+  has_brier  <- "brier_mean"  %in% names(cv_results)
+
+  if (is.null(track)) {
+    track <- if (has_loglik && !has_brier) "panel"
+             else if (has_brier) "event"
+             else stop("Cannot detect CV metric: neither brier_mean nor loglik_mean present")
+  }
+
+  if (track == "panel") {
+    list(
+      metric_col   = "loglik_mean",
+      sd_col       = if ("loglik_sd" %in% names(cv_results)) "loglik_sd" else NA_character_,
+      direction    = "higher",
+      y_label      = "Held-out log-lik per obs",
+      delta_label  = "Delta log-lik (per obs)",
+      helps_op     = function(d) d > 0,
+      track        = "panel"
+    )
+  } else {
+    list(
+      metric_col   = "brier_mean",
+      sd_col       = if ("brier_sd" %in% names(cv_results)) "brier_sd" else NA_character_,
+      direction    = "lower",
+      y_label      = "Brier score (mean)",
+      delta_label  = "Delta Brier",
+      helps_op     = function(d) d < 0,
+      track        = "event"
+    )
+  }
 }
 
 #' Specification curve of CV Brier scores
@@ -843,9 +904,11 @@ plot_cv_spec_curve <- function(cv_results, cv_strategy = "group_kfold") {
 #' @return Combined patchwork plot, or NULL
 plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfold",
                                             decision_vars = NULL,
-                                            config_registry_path = NULL) {
+                                            config_registry_path = NULL,
+                                            track = NULL) {
 
   cv_results <- normalize_cv_columns(cv_results)
+  metric <- detect_cv_metric(cv_results, track = track)
 
   # Link to config registry if path provided and config vars not yet present
   if (!is.null(config_registry_path) && !"embedding_model" %in% names(cv_results)) {
@@ -853,7 +916,9 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
   }
 
   df <- cv_results %>%
-    filter(cv_strategy == !!cv_strategy, !is.na(brier_mean), model_label == "full")
+    filter(cv_strategy == !!cv_strategy,
+           !is.na(.data[[metric$metric_col]]),
+           model_label == "full")
 
   if (nrow(df) == 0) {
     message("No CV full-model results for strategy: ", cv_strategy)
@@ -881,25 +946,33 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
     return(plot_cv_spec_curve(cv_results, cv_strategy))
   }
 
-  # Sort and rank
-  plot_data <- df %>%
-    arrange(brier_mean) %>%
-    mutate(rank = row_number())
+  # Sort and rank: best at left (lower for Brier, higher for log-lik)
+  plot_data <- if (metric$direction == "lower") {
+    df %>% arrange(.data[[metric$metric_col]])
+  } else {
+    df %>% arrange(desc(.data[[metric$metric_col]]))
+  }
+  plot_data <- plot_data %>% mutate(rank = row_number())
 
-  # Baselines
+  # Baselines (exclude any pre-computed delta rows)
   df_baselines <- cv_results %>%
     normalize_cv_columns() %>%
-    filter(cv_strategy == !!cv_strategy, !is.na(brier_mean), model_label != "full") %>%
+    filter(cv_strategy == !!cv_strategy,
+           !is.na(.data[[metric$metric_col]]),
+           model_label != "full",
+           !grepl("^delta_", model_label)) %>%
     group_by(model_label) %>%
-    summarise(brier_mean = mean(brier_mean, na.rm = TRUE), .groups = "drop")
+    summarise(.metric = mean(.data[[metric$metric_col]], na.rm = TRUE),
+              .groups = "drop")
 
   strategy_label <- ifelse(cv_strategy == "group_kfold", "Group K-Fold", "Time-Series")
+  title_prefix <- if (metric$track == "panel") "CV Held-out Log-Lik" else "CV Brier Scores"
 
-  # Build the top panel (Brier curve)
-  p_top <- ggplot(plot_data, aes(x = rank, y = brier_mean)) +
+  # Build the top panel
+  p_top <- ggplot(plot_data, aes(x = rank, y = .data[[metric$metric_col]])) +
     geom_point(size = 0.8, alpha = 0.7, color = "#2c7bb6") +
-    labs(y = "Brier score (mean)",
-         title = paste0("CV Brier Scores: ", strategy_label)) +
+    labs(y = metric$y_label,
+         title = paste0(title_prefix, ": ", strategy_label)) +
     theme_minimal(base_size = PLOT_BASE_SIZE) +
     theme(
       axis.text.x = element_blank(),
@@ -911,10 +984,10 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
   # Add baseline reference lines
   for (i in seq_len(nrow(df_baselines))) {
     p_top <- p_top +
-      geom_hline(yintercept = df_baselines$brier_mean[i],
+      geom_hline(yintercept = df_baselines$.metric[i],
                  linetype = "dashed", color = "gray50") +
       annotate("text", x = max(plot_data$rank) * 0.95,
-               y = df_baselines$brier_mean[i],
+               y = df_baselines$.metric[i],
                label = df_baselines$model_label[i],
                hjust = 1, vjust = -0.5, size = PLOT_LABEL_SIZE + 0.5, color = "gray40")
   }
@@ -967,8 +1040,9 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
 
   # Add x-axis to last panel
   n_panels <- length(panel_plots)
+  sort_label <- if (metric$track == "panel") "log-lik (best at left)" else "Brier score"
   panel_plots[[n_panels]] <- panel_plots[[n_panels]] +
-    labs(x = "Specification (sorted by Brier score)") +
+    labs(x = paste0("Specification (sorted by ", sort_label, ")")) +
     theme(axis.title.x = element_text(size = PLOT_BASE_SIZE))
 
   # Combine
@@ -985,61 +1059,69 @@ plot_cv_spec_curve_with_panels <- function(cv_results, cv_strategy = "group_kfol
 #' @param cv_strategy "group_kfold" or "timeseries"
 #' @return ggplot object
 plot_delta_brier <- function(cv_results, cv_strategy = "group_kfold",
-                             baseline_label = NULL) {
+                             baseline_label = NULL, track = NULL) {
 
   cv_results <- normalize_cv_columns(cv_results)
+  metric <- detect_cv_metric(cv_results, track = track)
 
   # Auto-detect baseline if not specified: prefer no_climate > seasonal_ops > first non-full
   if (is.null(baseline_label)) {
-    available <- setdiff(unique(cv_results$model_label), "full")
+    available <- setdiff(unique(cv_results$model_label), c("full"))
+    available <- available[!grepl("^delta_", available)]
     preferred <- c("no_climate", "seasonal_ops", "best_non_climate")
     baseline_label <- preferred[preferred %in% available][1]
     if (is.na(baseline_label)) baseline_label <- available[1]
   }
 
   if (is.na(baseline_label) || is.null(baseline_label)) {
-    message("Cannot compute delta-Brier: no non-full baseline found")
+    message("Cannot compute delta: no non-full baseline found")
     return(NULL)
   }
 
   df_strat <- cv_results %>%
-    filter(cv_strategy == !!cv_strategy, !is.na(brier_mean)) %>%
+    filter(cv_strategy == !!cv_strategy, !is.na(.data[[metric$metric_col]])) %>%
     filter(model_label %in% c("full", baseline_label)) %>%
-    select(config_id, climate_var, model_label, brier_mean) %>%
-    pivot_wider(names_from = model_label, values_from = brier_mean,
+    select(config_id, climate_var, model_label,
+           .metric = all_of(metric$metric_col)) %>%
+    pivot_wider(names_from = model_label, values_from = .metric,
                 id_cols = c(config_id, climate_var))
 
   if (!all(c("full", baseline_label) %in% names(df_strat))) {
-    message("Cannot compute delta-Brier: missing 'full' or '", baseline_label, "' after pivot")
+    message("Cannot compute delta: missing 'full' or '", baseline_label, "' after pivot")
     return(NULL)
   }
 
   df <- df_strat %>%
     filter(!is.na(.data[["full"]]), !is.na(.data[[baseline_label]])) %>%
-    mutate(delta_brier = .data[["full"]] - .data[[baseline_label]]) %>%
-    arrange(delta_brier) %>%
+    mutate(delta = .data[["full"]] - .data[[baseline_label]],
+           helps = metric$helps_op(delta)) %>%
+    arrange(if (metric$direction == "lower") delta else desc(delta)) %>%
     mutate(spec_rank = row_number())
 
   if (nrow(df) == 0) {
-    message("Cannot compute delta-Brier")
+    message("Cannot compute delta")
     return(NULL)
   }
 
-  n_better <- sum(df$delta_brier < 0)
+  n_better <- sum(df$helps, na.rm = TRUE)
   n_total  <- nrow(df)
   baseline_display <- gsub("_", " ", baseline_label)
 
-  ggplot(df, aes(x = spec_rank, y = delta_brier)) +
+  better_text <- if (metric$direction == "lower") "negative = better" else "positive = better"
+  title_prefix <- if (metric$track == "panel") "Delta log-lik" else "Delta-Brier"
+
+  ggplot(df, aes(x = spec_rank, y = delta)) +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-    geom_col(aes(fill = delta_brier < 0), width = 0.8, alpha = 0.7) +
+    geom_col(aes(fill = helps), width = 0.8, alpha = 0.7) +
     scale_fill_manual(
       values = c("TRUE" = "#1D9E75", "FALSE" = "#E24B4A"),
       labels = c("TRUE" = "Climate helps", "FALSE" = "Climate hurts"),
       name = NULL
     ) +
-    labs(x = "Specification (ordered)", y = "Delta Brier (negative = better)",
-         title = sprintf("Delta-Brier: Full Model vs. %s baseline",
-                         tools::toTitleCase(baseline_display)),
+    labs(x = "Specification (ordered)",
+         y = paste0(metric$delta_label, " (", better_text, ")"),
+         title = sprintf("%s: Full Model vs. %s baseline",
+                         title_prefix, tools::toTitleCase(baseline_display)),
          subtitle = sprintf("%d/%d specifications improved by climate", n_better, n_total)) +
     theme_minimal(base_size = PLOT_BASE_SIZE) +
     theme(legend.position = "top")
@@ -1442,7 +1524,7 @@ plot_cross_industry_climate_vs_ops <- function(industries, industry_labels = NUL
                              mean_estimate - sd_estimate - max(abs(plot_data$mean_estimate)) * 0.05)),
               size = PLOT_LABEL_SIZE - 0.3, color = "gray30") +
     coord_flip() +
-    facet_wrap(~ facet_label, scales = "free", ncol = 2) +
+    facet_wrap(~ facet_label, scales = "free", ncol = 3) +
     scale_fill_manual(
       values = c("primary" = "#e41a1c", "between" = "#377eb8", "within" = "#4daf4a"),
       labels = c("primary" = "Climate", "between" = "Between-org", "within" = "Within-org"),

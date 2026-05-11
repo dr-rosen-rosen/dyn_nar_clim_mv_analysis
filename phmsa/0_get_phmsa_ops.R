@@ -1,5 +1,20 @@
 # =============================================================================
-# phmsa/0_get_phmsa_ops.R — PHMSA Operator Mileage Processing
+# phmsa/0_get_phmsa_ops.R — PHMSA Operator Mileage Processing  [DEPRECATED]
+# =============================================================================
+#
+# *** DEPRECATED 2026-04-29 ***
+# This script has been superseded by the Python ops pipeline at:
+#   dynclim/data/phmsa_ops_pipeline.py
+#
+# The Python pipeline produces the same operator_annual_ops.parquet (same
+# schema, same Mundlak between/within decomposition) and is the canonical
+# preprocessing step going forward. This R script is kept as a fallback for
+# users without Python and may be removed in a future cleanup.
+#
+# To regenerate the parquet, prefer:
+#   python3 dynclim/data/phmsa_ops_pipeline.py \
+#       --base-dir dynclim/data/raw/phmsa/operator_data \
+#       --output   dynclim/data/processed/phmsa --summary
 # =============================================================================
 #
 # Loads PHMSA annual report CSV files for each pipeline type, extracts the
@@ -10,7 +25,9 @@
 #   GD — annual_gas_distribution_2010_present 2/GD AR {year}.csv
 #         Key column: MMILES_TOTAL
 #   GT — annual_gas_transmission_gathering_2010_present/GT AR {year} Part A to D.csv
-#         Key column: PARTB192MILESTOTAL  (onshore + offshore, already summed)
+#         Key column: PARTDTOTALMILES  (Part D grand-total: transmission + gathering;
+#         the only column populated consistently across 2017-2025. PARTB192MILESTOTAL
+#         is empty pre-2021 and ~71% zero from 2021+ — Part 192 transmission only.)
 #   HL — annual_hazardous_liquid_2010_present/HL AR {year} Part A to E.csv
 #         Key column: PARTDTOTALMILES
 #
@@ -25,6 +42,7 @@
 suppressPackageStartupMessages({
   library(dplyr)
   library(readr)
+  library(readxl)
   library(arrow)
   library(stringr)
   library(slider)
@@ -84,43 +102,100 @@ read_col_safe <- function(path, col_name) {
   })
 }
 
-# --- Gas Distribution ---
-cat("--- Loading GD annual reports ---\n")
-gd_raw <- map_dfr(GD_YEARS, function(yr) {
-  path <- file.path(GD_DIR, sprintf("GD AR %d.csv", yr))
-  if (!file.exists(path)) { message(sprintf("  Missing: %s", basename(path))); return(NULL) }
-  df <- read_col_safe(path, "MMILES_TOTAL")
-  if (!is.null(df)) df$REPORT_YEAR <- yr   # ensure year set correctly
+
+#' Read one column from a pre-2017 PHMSA annual-report xlsx file.
+#'
+#' Pre-2017 reports come as single-sheet xlsx with two documentation rows
+#' before the header (row 1 = "One operator can have multiple reports per
+#' year (...)", row 2 = "Records sorted by ..."). Real column names start at
+#' row 3. The mile column names match the post-2017 CSVs.
+read_xlsx_col_safe <- function(path, col_name) {
+  tryCatch({
+    df <- suppressWarnings(read_excel(path, skip = 2L,
+                                       .name_repair = "minimal"))
+    needed <- c("OPERATOR_ID", "REPORT_YEAR", col_name)
+    missing <- setdiff(needed, names(df))
+    if (length(missing) > 0) {
+      warning(sprintf("xlsx %s missing columns: %s",
+                      basename(path), paste(missing, collapse = ", ")))
+      return(NULL)
+    }
+    df %>%
+      transmute(
+        OPERATOR_ID = suppressWarnings(as.integer(.data[["OPERATOR_ID"]])),
+        REPORT_YEAR = suppressWarnings(as.integer(.data[["REPORT_YEAR"]])),
+        total_miles = suppressWarnings(as.numeric(.data[[col_name]]))
+      ) %>%
+      filter(!is.na(OPERATOR_ID), !is.na(REPORT_YEAR))
+  }, error = function(e) {
+    warning(sprintf("Failed to read %s: %s", basename(path), conditionMessage(e)))
+    NULL
+  })
+}
+
+
+#' Resolve the source file for one (pipeline_type, year), preferring CSV when
+#' present (post-2017) and falling back to xlsx (2010–2016).
+#'
+#' @return list(path, format) or NULL if neither file exists.
+.resolve_phmsa_source <- function(pipeline_type, yr) {
+  csv_path <- switch(pipeline_type,
+    "GD" = file.path(GD_DIR, sprintf("GD AR %d.csv", yr)),
+    "GT" = file.path(GT_DIR, sprintf("GT AR %d Part A to D.csv", yr)),
+    "HL" = file.path(HL_DIR, sprintf("HL AR %d Part A to E.csv", yr)),
+    stop("Unknown pipeline type: ", pipeline_type)
+  )
+  xlsx_path <- switch(pipeline_type,
+    "GD" = file.path(GD_DIR, sprintf("annual_gas_distribution_%d.xlsx", yr)),
+    "GT" = file.path(GT_DIR, sprintf("annual_gas_transmission_gathering_%d.xlsx", yr)),
+    "HL" = file.path(HL_DIR, sprintf("annual_hazardous_liquid_%d.xlsx", yr))
+  )
+  if (file.exists(csv_path))  return(list(path = csv_path,  format = "csv"))
+  if (file.exists(xlsx_path)) return(list(path = xlsx_path, format = "xlsx"))
+  NULL
+}
+
+
+#' Read one (pipeline_type, year) regardless of source file format.
+.read_phmsa_year <- function(pipeline_type, yr, col_name) {
+  src <- .resolve_phmsa_source(pipeline_type, yr)
+  if (is.null(src)) {
+    message(sprintf("  Missing: %s %d (no csv or xlsx found)", pipeline_type, yr))
+    return(NULL)
+  }
+  df <- if (src$format == "csv") {
+    read_col_safe(src$path, col_name)
+  } else {
+    read_xlsx_col_safe(src$path, col_name)
+  }
+  if (!is.null(df)) df$REPORT_YEAR <- yr
   df
-}) %>% mutate(pipeline_type = "gas_distribution")
+}
+
+# --- Gas Distribution ---
+# 2010-2016 are .xlsx; 2017+ are .csv. .read_phmsa_year() picks the right
+# format automatically.
+cat("--- Loading GD annual reports (csv 2017+ + xlsx 2010-2016) ---\n")
+gd_raw <- map_dfr(GD_YEARS, ~ .read_phmsa_year("GD", .x, "MMILES_TOTAL")) %>%
+  mutate(pipeline_type = "gas_distribution")
 cat(sprintf("  GD rows: %s | operators: %d | years: %d-%d\n",
     format(nrow(gd_raw), big.mark = ","),
     n_distinct(gd_raw$OPERATOR_ID),
     min(gd_raw$REPORT_YEAR), max(gd_raw$REPORT_YEAR)))
 
-# --- Gas Transmission (Part A to D only — has PARTB192MILESTOTAL) ---
-cat("--- Loading GT annual reports (Part A to D) ---\n")
-gt_raw <- map_dfr(GT_YEARS, function(yr) {
-  path <- file.path(GT_DIR, sprintf("GT AR %d Part A to D.csv", yr))
-  if (!file.exists(path)) { message(sprintf("  Missing: %s", basename(path))); return(NULL) }
-  df <- read_col_safe(path, "PARTB192MILESTOTAL")
-  if (!is.null(df)) df$REPORT_YEAR <- yr
-  df
-}) %>% mutate(pipeline_type = "gas_transmission")
+# --- Gas Transmission ---
+cat("--- Loading GT annual reports (csv 2017+ + xlsx 2010-2016) ---\n")
+gt_raw <- map_dfr(GT_YEARS, ~ .read_phmsa_year("GT", .x, "PARTDTOTALMILES")) %>%
+  mutate(pipeline_type = "gas_transmission")
 cat(sprintf("  GT rows: %s | operators: %d | years: %d-%d\n",
     format(nrow(gt_raw), big.mark = ","),
     n_distinct(gt_raw$OPERATOR_ID),
     min(gt_raw$REPORT_YEAR), max(gt_raw$REPORT_YEAR)))
 
-# --- Hazardous Liquid (Part A to E only — has PARTDTOTALMILES) ---
-cat("--- Loading HL annual reports (Part A to E) ---\n")
-hl_raw <- map_dfr(HL_YEARS, function(yr) {
-  path <- file.path(HL_DIR, sprintf("HL AR %d Part A to E.csv", yr))
-  if (!file.exists(path)) { message(sprintf("  Missing: %s", basename(path))); return(NULL) }
-  df <- read_col_safe(path, "PARTDTOTALMILES")
-  if (!is.null(df)) df$REPORT_YEAR <- yr
-  df
-}) %>% mutate(pipeline_type = "hazardous_liquid")
+# --- Hazardous Liquid ---
+cat("--- Loading HL annual reports (csv 2017+ + xlsx 2010-2016) ---\n")
+hl_raw <- map_dfr(HL_YEARS, ~ .read_phmsa_year("HL", .x, "PARTDTOTALMILES")) %>%
+  mutate(pipeline_type = "hazardous_liquid")
 cat(sprintf("  HL rows: %s | operators: %d | years: %d-%d\n",
     format(nrow(hl_raw), big.mark = ","),
     n_distinct(hl_raw$OPERATOR_ID),

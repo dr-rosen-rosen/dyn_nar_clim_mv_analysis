@@ -44,11 +44,11 @@ source("phmsa/fit_models.R")
 # PATHS
 # =============================================================================
 
-CFG_DIR   <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/phmsa_04-24-2026"
+CFG_DIR   <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/phmsa_04-28-2026"
 EVENTS_PATH  <- here("data/phmsa/events.parquet")
 OPS_PATH     <- here("data/phmsa/operator_annual_ops.parquet")
-OUTPUT_DIR   <- here("results/phmsa")
-CV_CHECKPOINT_DIR <- here("results/phmsa/cv_checkpoints")
+OUTPUT_DIR   <- here("results_new_new/phmsa")
+CV_CHECKPOINT_DIR <- here("results_new_new/phmsa/cv_checkpoints")
 
 N_WORKERS <- 20L
 
@@ -168,6 +168,6 @@ cat("  Source phmsa/2_phmsa_cv.R to run cross-validation.\n\n")
 
 source("phmsa/1_phmsa_multiverse.R")
 
-mv <- arrow::read_parquet("/Users/michaelrosen/Documents/data_anlaysis/dyn_nar_clim_mv_analysis/results/phmsa/mv_results_all_types.parquet")
+# mv <- arrow::read_parquet("/Users/michaelrosen/Documents/data_anlaysis/dyn_nar_clim_mv_analysis/results/phmsa/mv_results_all_types.parquet")
 source("phmsa/2_phmsa_cv.R")
-cv <- arrow::read_parquet("/Users/michaelrosen/Documents/data_anlaysis/dyn_nar_clim_mv_analysis/results/phmsa/cv_results_all_types.parquet")
+# cv <- arrow::read_parquet("/Users/michaelrosen/Documents/data_anlaysis/dyn_nar_clim_mv_analysis/results/phmsa/cv_results_all_types.parquet")

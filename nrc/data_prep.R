@@ -147,9 +147,14 @@ encode_nrc_outcomes <- function(df) {
       mutate(
         .scram_raw = tolower(trimws(as.character(scram_code))),
         scram_ord = case_when(
-          .scram_raw %in% c("a", "auto", "automatic", "a/m") ~ 2L,
-          .scram_raw %in% c("m", "manual")                   ~ 1L,
-          TRUE                                                ~ 0L
+          # Automatic scram (A) and automatic scram with reactor trip (A/R)
+          # are both severity-2 ("automatic"). The /R suffix only flags that
+          # the reactor tripped sub-critical; it doesn't increase severity.
+          .scram_raw %in% c("a", "a/r", "auto", "automatic", "a/m") ~ 2L,
+          # Manual scram (M) and manual with reactor trip (M/R) are both
+          # severity-1 ("manual").
+          .scram_raw %in% c("m", "m/r", "manual")                   ~ 1L,
+          TRUE                                                       ~ 0L
         ),
         scram_binary = as.integer(scram_ord > 0),
         scram_ord_factor = factor(scram_ord, ordered = TRUE)

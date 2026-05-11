@@ -108,6 +108,134 @@ load_asrs_meta <- function(asrs_csv_path) {
 }
 
 
+#' Load FAA AIDS data and aggregate to airport-month panel.
+#'
+#' Mirrors load_ntsb_panel_rate() but uses the AIDS pipeline output
+#' (aids_events.parquet from dynclim/data/aids_data_pipeline.py). AIDS gives
+#' a much broader event base than NTSB (incidents in addition to accidents),
+#' which dramatically reduces zero-inflation in the airport-month panel.
+#'
+#' @param aids_parquet_path Path to aids_events.parquet
+#' @param apt_dist_nm Maximum nautical miles from nearest airport for off-
+#'   airport events. On-airport events (on_airport == TRUE) are always kept.
+#'   Default 5 to mirror NTSB filter.
+#' @param min_year Minimum event year (default 1988 to align with ASRS climate
+#'   feature availability). Set to NULL to keep all years.
+#' @return Tibble: airport_id, yearmonth (Date), n_aids_all, n_aids_accidents,
+#'   n_aids_incidents. One row per airport-month with at least one AIDS event.
+load_aids_panel_rate <- function(aids_parquet_path,
+                                  apt_dist_nm = 5L,
+                                  min_year    = 1988L) {
+
+  message(sprintf("  Loading AIDS data (apt_dist <= %d NM, min_year = %s)...",
+                  apt_dist_nm,
+                  if (is.null(min_year)) "all" else as.character(min_year)))
+
+  aids <- arrow::read_parquet(aids_parquet_path) %>%
+    mutate(
+      airport_id = str_to_upper(str_trim(as.character(airport_id))),
+      airport_id = na_if(airport_id, ""),
+      airport_id = na_if(airport_id, "NA"),
+      event_date = as.Date(event_date),
+      apt_dist_nm = as.numeric(apt_dist_nm),
+      on_airport  = as.logical(on_airport)
+    ) %>%
+    filter(!is.na(event_date), !is.na(airport_id))
+
+  if (!is.null(min_year)) {
+    aids <- aids %>% filter(event_year >= min_year)
+  }
+
+  # Near-airport filter: keep on-airport events plus off-airport events
+  # within apt_dist_nm. NA distances on off-airport events are dropped
+  # (we don't know if they're nearby).
+  aids <- aids %>%
+    filter(on_airport |
+             (!on_airport & !is.na(apt_dist_nm) & apt_dist_nm <= !!apt_dist_nm))
+
+  panel <- aids %>%
+    mutate(yearmonth = lubridate::floor_date(event_date, "month")) %>%
+    group_by(airport_id, yearmonth) %>%
+    summarise(
+      n_aids_all       = n(),
+      n_aids_accidents = sum(event_type == "accident", na.rm = TRUE),
+      n_aids_incidents = sum(event_type == "incident", na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  message(sprintf(
+    "  AIDS panel: %s airport-months | %d airports | %s -- %s | totals: all=%s, acc=%s, inc=%s",
+    format(nrow(panel),                 big.mark = ","),
+    n_distinct(panel$airport_id),
+    format(min(panel$yearmonth)), format(max(panel$yearmonth)),
+    format(sum(panel$n_aids_all),       big.mark = ","),
+    format(sum(panel$n_aids_accidents), big.mark = ","),
+    format(sum(panel$n_aids_incidents), big.mark = ",")
+  ))
+
+  panel
+}
+
+
+#' Load ASRS metadata from the Python-generated events.parquet
+#'
+#' Replaces load_asrs_meta() for the panel-rate pipeline. The Python feature
+#' extractor outputs scores keyed by `eid` (UUID5 derived from ACN), not the
+#' raw ASRS Accession Number. Loading metadata from events.parquet gives us
+#' both `eid` (for joining to scores) and `raw_event_id` (original ACN, kept
+#' for traceability), plus the standard fields the panel needs.
+#'
+#' @param events_parquet_path Path to processed/aviation/events.parquet
+#'   (output of dynclim/data/aviation_data_pipeline.py)
+#' @return Tibble: eid, raw_event_id, airport_id, event_date, atc_local,
+#'   atc_terminal, atc_enroute, atc_any
+load_asrs_meta_panel <- function(events_parquet_path) {
+
+  message(sprintf("  Loading ASRS metadata from %s ...",
+                  basename(events_parquet_path)))
+
+  # Python pipeline emits `airport` (not `airport_id`); rename to align with
+  # downstream panel-prep expectations.
+  raw <- arrow::read_parquet(events_parquet_path) %>%
+    select(any_of(c("eid", "raw_event_id", "airport", "event_date",
+                    "reporter_function"))) %>%
+    rename(airport_id = airport) %>%
+    mutate(
+      eid           = as.character(eid),
+      raw_event_id  = as.character(raw_event_id),
+      airport_id    = str_to_upper(str_trim(as.character(airport_id))),
+      airport_id    = na_if(airport_id, ""),
+      airport_id    = na_if(airport_id, "NA"),
+      event_date    = as.Date(event_date)
+    )
+
+  is_any_of <- function(col, targets) {
+    purrr::map_lgl(str_split(col, ";\\s*"),
+                    ~ any(str_trim(.x) %in% targets))
+  }
+
+  raw <- raw %>%
+    mutate(
+      atc_local    = is_any_of(reporter_function, ATC_FUNCTIONS_LOCAL),
+      atc_terminal = is_any_of(reporter_function, ATC_FUNCTIONS_TERMINAL),
+      atc_enroute  = is_any_of(reporter_function, ATC_FUNCTIONS_ENROUTE),
+      atc_any      = atc_local | atc_terminal | atc_enroute
+    ) %>%
+    select(eid, raw_event_id, airport_id, event_date,
+           atc_local, atc_terminal, atc_enroute, atc_any) %>%
+    filter(!is.na(event_date), !is.na(airport_id))
+
+  message(sprintf("  ASRS metadata: %s reports | %d airports | ATC: %s (%.1f%%)",
+    format(nrow(raw), big.mark = ","),
+    n_distinct(raw$airport_id),
+    format(sum(raw$atc_any), big.mark = ","),
+    100 * mean(raw$atc_any)
+  ))
+
+  raw
+}
+
+
 # =============================================================================
 # SECTION 2 — NTSB OUTCOME LOADING AND ENCODING
 # =============================================================================

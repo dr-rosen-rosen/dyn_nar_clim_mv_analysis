@@ -21,6 +21,15 @@ library(patchwork)
 # Adjust this path to match your project layout
 # source("shared/postprocessing.R")
 
+# Champion-model analysis (auto-sourced if present in same dir)
+.bma_path <- file.path(
+  dirname(normalizePath("common/generate_mv_report.R", mustWork = FALSE)),
+  "best_model_analysis.R"
+)
+if (!exists("compute_champions", mode = "function") && file.exists(.bma_path)) {
+  source(.bma_path, local = FALSE)
+}
+
 
 # ==============================================================================
 # INDUSTRY CONFIGURATION SPEC
@@ -66,7 +75,8 @@ industry_config <- function(mv_results,
                             cv_filter_baseline = NULL,
                             cv_filter_require_both = FALSE,
                             cv_filter_level = "config_window",
-                            analysis_type = "mv") {
+                            analysis_type = "mv",
+                            track = "event") {
   list(
     mv_results              = mv_results,
     config_registry         = config_registry,
@@ -79,7 +89,8 @@ industry_config <- function(mv_results,
     cv_filter_baseline      = cv_filter_baseline,
     cv_filter_require_both  = cv_filter_require_both,
     cv_filter_level         = cv_filter_level,
-    analysis_type           = analysis_type
+    analysis_type           = analysis_type,
+    track                   = track
   )
 }
 
@@ -96,7 +107,9 @@ figure_dims <- function(figure_type, n_panels = 6) {
     config_importance = list(width = 10, height = 6),
     climate_vs_ops    = list(width = 11, height = 7),
     cv_brier_spec     = list(width = 14, height = 6 + n_panels * 0.7),
+    cv_loglik_spec    = list(width = 14, height = 6 + n_panels * 0.7),
     delta_brier       = list(width = 12, height = 6),
+    delta_loglik      = list(width = 12, height = 6),
     robustness_table  = list(width = 10, height = 4),
     # fallback
     list(width = 11, height = 8)
@@ -345,7 +358,8 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
         cv_results,
         baseline_strategy = ind_config$cv_filter_baseline,
         require_both_strategies = ind_config$cv_filter_require_both,
-        filter_level = ind_config$cv_filter_level %||% "config_window"
+        filter_level = ind_config$cv_filter_level %||% "config_window",
+        track = ind_config$track %||% "event"
       )
       credible_ids <- cv_filter_result$credible_configs
 
@@ -394,6 +408,67 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
       write_csv(cv_filter_result$credible_pairs,
                 file.path(industry_dir, "cv_credible_pairs.csv"))
     }
+  }
+
+  # --- Champion model analysis (CV + MV both required) ---
+  # Single best spec per (outcome × cv_strategy) plus the candidate-champion
+  # pool within 10% of the best, then facet enrichment within those pools.
+  if (!is.null(cv_results) && exists("compute_champions", mode = "function")) {
+    tryCatch({
+      cv_norm <- normalize_cv_columns(cv_results)
+      champ <- compute_champions(cv_norm, results_full,
+                                  threshold_pct = 0.10, min_pool_size = 5L)
+
+      if (nrow(champ$best) > 0) {
+        write_csv(champ$best,
+                  file.path(industry_dir, "champions_best.csv"))
+      }
+      if (nrow(champ$candidates) > 0) {
+        write_csv(champ$candidates,
+                  file.path(industry_dir, "champions_candidates.csv"))
+      }
+      if (nrow(champ$diagnostics) > 0) {
+        write_csv(champ$diagnostics,
+                  file.path(industry_dir, "champions_diagnostics.csv"))
+      }
+
+      enrich <- compute_facet_enrichment(champ, results_full)
+      if (nrow(enrich) > 0) {
+        write_csv(enrich,
+                  file.path(industry_dir, "champions_facet_enrichment.csv"))
+      }
+
+      # Stash the champions object so the caller can roll up cross-industry
+      assign(paste0(".champions_", industry_key), champ, envir = parent.frame())
+      if (verbose) message(sprintf("  [OK] Champion analysis (%d cells, %d candidates)",
+                                    nrow(champ$diagnostics), nrow(champ$candidates)))
+    }, error = function(e) {
+      if (verbose) message(sprintf("  [ERR] Champion analysis: %s", conditionMessage(e)))
+    })
+  }
+
+
+  # --- Model details (panel track only) ---
+  # Surfaces family choice and Tweedie variance-power per outcome, for the
+  # appendix table in the Quarto report.
+  if ((ind_config$track %||% "event") == "panel" && "family" %in% names(results_full)) {
+    md <- results_full %>%
+      filter(status == "success") %>%
+      group_by(outcome) %>%
+      summarise(
+        family               = paste(sort(unique(family)), collapse = "/"),
+        n_configs            = n_distinct(config_id),
+        n_climate_windows    = n_distinct(climate_var),
+        median_n_obs         = if ("n_obs" %in% names(.)) median(n_obs, na.rm = TRUE) else NA_real_,
+        median_n_orgs        = if ("n_orgs" %in% names(.)) median(n_orgs, na.rm = TRUE) else NA_real_,
+        median_n_periods     = if ("n_periods" %in% names(.)) median(n_periods, na.rm = TRUE) else NA_real_,
+        median_pct_zero      = if ("pct_zero_outcome" %in% names(.)) median(pct_zero_outcome, na.rm = TRUE) else NA_real_,
+        median_re_sd         = if ("random_intercept_sd" %in% names(.)) median(random_intercept_sd, na.rm = TRUE) else NA_real_,
+        median_tweedie_power = if ("tweedie_power" %in% names(.)) median(tweedie_power, na.rm = TRUE) else NA_real_,
+        .groups = "drop"
+      )
+    write_csv(md, file.path(industry_dir, "model_details.csv"))
+    if (verbose) message("  [OK] Model details (panel)")
   }
 
   # --- Helper: generate all MV figures for a given result set ---
@@ -545,33 +620,43 @@ generate_industry_figures <- function(industry_key, ind_config, output_dir,
             tryCatch({
               p_brier <- plot_cv_spec_curve_with_panels(
                 cv_for_outcome, cv_strategy = cv_strat,
-                decision_vars = ind_config$decision_vars
+                decision_vars = ind_config$decision_vars,
+                track = ind_config$track %||% "event"
               )
               if (!is.null(p_brier)) {
                 n_p <- length(ind_config$decision_vars %||%
                                c("window_type", "embedding_model", "sent_method", "comp__method"))
                 dims <- figure_dims("cv_brier_spec", n_p)
+                fig_type <- if ((ind_config$track %||% "event") == "panel")
+                  "cv_loglik_spec" else "cv_brier_spec"
                 local_idx <- local_idx + 1
                 local_rows[[local_idx]] <- save_figure(
-                  p_brier, industry_dir, outcome, cv_strat, "cv_brier_spec",
+                  p_brier, industry_dir, outcome, cv_strat, fig_type,
                   industry_key, dims, format
                 )
-                if (verbose) message(sprintf("      [OK] CV Brier spec (%s)", cv_strat))
+                if (verbose) message(sprintf("      [OK] CV %s spec (%s)",
+                                              if (fig_type == "cv_loglik_spec") "log-lik" else "Brier",
+                                              cv_strat))
               }
             }, error = function(e) {
               if (verbose) message(sprintf("      [ERR] CV Brier spec (%s): %s", cv_strat, conditionMessage(e)))
             })
 
             tryCatch({
-              p_delta <- plot_delta_brier(cv_for_outcome, cv_strategy = cv_strat)
+              p_delta <- plot_delta_brier(cv_for_outcome, cv_strategy = cv_strat,
+                                          track = ind_config$track %||% "event")
               if (!is.null(p_delta)) {
                 dims <- figure_dims("delta_brier")
+                fig_type <- if ((ind_config$track %||% "event") == "panel")
+                  "delta_loglik" else "delta_brier"
                 local_idx <- local_idx + 1
                 local_rows[[local_idx]] <- save_figure(
-                  p_delta, industry_dir, outcome, cv_strat, "delta_brier",
+                  p_delta, industry_dir, outcome, cv_strat, fig_type,
                   industry_key, dims, format
                 )
-                if (verbose) message(sprintf("      [OK] Delta-Brier (%s)", cv_strat))
+                if (verbose) message(sprintf("      [OK] %s (%s)",
+                                              if (fig_type == "delta_loglik") "Delta-loglik" else "Delta-Brier",
+                                              cv_strat))
               }
             }, error = function(e) {
               if (verbose) message(sprintf("      [ERR] Delta-Brier (%s): %s", cv_strat, conditionMessage(e)))
@@ -701,12 +786,20 @@ generate_mv_figures <- function(industries, output_dir = "report_figures",
       if (verbose) message(sprintf("  [ERR] Importance comparison: %s", conditionMessage(e)))
     })
 
+    # Helper: dims for the cross-industry climate-vs-ops plot. The plot uses
+    # facet_wrap(ncol = 3); height should grow with the row count so the
+    # rendered PDF doesn't overflow the Quarto landscape page.
+    .cv_ops_dims <- function(n_panels) {
+      n_rows <- ceiling(n_panels / 3)
+      list(width = 14, height = max(7, n_rows * 1.7 + 2))
+    }
+
     # 3. Cross-industry climate vs ops (faceted by industry) — UNFILTERED
     tryCatch({
       p_ops <- plot_cross_industry_climate_vs_ops(industries, industry_labels)
       if (!is.null(p_ops)) {
         n_panels <- length(industries) * 3
-        dims <- list(width = 14, height = max(8, 3 + n_panels * 1.2))
+        dims <- .cv_ops_dims(n_panels)
         cross_idx <- cross_idx + 1
         cross_rows[[cross_idx]] <- save_figure(
           p_ops, cross_dir, "summary", NULL, "climate_vs_ops_comparison",
@@ -745,7 +838,7 @@ generate_mv_figures <- function(industries, output_dir = "report_figures",
         )
         if (!is.null(p_ops_filt)) {
           n_panels <- length(industries) * 3
-          dims <- list(width = 14, height = max(8, 3 + n_panels * 1.2))
+          dims <- .cv_ops_dims(n_panels)
           cross_idx <- cross_idx + 1
           cross_rows[[cross_idx]] <- save_figure(
             p_ops_filt, cross_dir, "summary", NULL, "climate_vs_ops_comparison_filtered",
@@ -755,6 +848,77 @@ generate_mv_figures <- function(industries, output_dir = "report_figures",
         }
       }, error = function(e) {
         if (verbose) message(sprintf("  [ERR] Filtered ops comparison: %s", conditionMessage(e)))
+      })
+    }
+
+    # 5. Cross-industry climate vs ops — CHAMPION-FILTERED. Same plot as
+    # CV-filtered, but the per-industry credible_pairs come from each
+    # industry's champions_candidates.csv (top decile per outcome × CV
+    # strategy) rather than the CV-filter pool. Used by the executive-summary
+    # condensed report.
+    champion_pairs_by_industry <- list()
+    for (ind_key in names(industries)) {
+      cand_path <- file.path(output_dir, ind_key, "champions_candidates.csv")
+      if (!file.exists(cand_path)) next
+      cand <- read_csv(cand_path, show_col_types = FALSE)
+      if (!"climate_var" %in% names(cand) || !"config_id" %in% names(cand)) next
+      champion_pairs_by_industry[[ind_key]] <-
+        cand %>%
+          mutate(config_id = as.character(config_id)) %>%
+          distinct(config_id, climate_var) %>%
+          rename(climate_var_tested = climate_var)
+    }
+
+    if (length(champion_pairs_by_industry) > 0) {
+      tryCatch({
+        p_ops_champ <- plot_cross_industry_climate_vs_ops(
+          industries, industry_labels,
+          credible_pairs = champion_pairs_by_industry
+        )
+        if (!is.null(p_ops_champ)) {
+          n_panels <- length(industries) * 3
+          dims <- .cv_ops_dims(n_panels)
+          cross_idx <- cross_idx + 1
+          cross_rows[[cross_idx]] <- save_figure(
+            p_ops_champ, cross_dir, "summary", NULL, "climate_vs_ops_comparison_champions",
+            "_cross_industry", dims, format
+          )
+          if (verbose) message("  [OK] Climate vs ops comparison plot (champion-filtered)")
+        }
+      }, error = function(e) {
+        if (verbose) message(sprintf("  [ERR] Champion-filtered ops comparison: %s",
+                                      conditionMessage(e)))
+      })
+    }
+
+    # Cross-industry champion roll-up — reads each industry's
+    # champions_candidates.csv and counts dominant facet levels across all
+    # (industry × outcome × cv_strategy) cells.
+    if (exists("summarize_champions_cross_industry", mode = "function")) {
+      tryCatch({
+        ind_champs <- list()
+        for (ind_key in names(industries)) {
+          cand_path <- file.path(output_dir, ind_key, "champions_candidates.csv")
+          if (file.exists(cand_path)) {
+            ind_champs[[ind_key]] <- list(
+              candidates = read_csv(cand_path, show_col_types = FALSE)
+            )
+          }
+        }
+        if (length(ind_champs) > 0) {
+          xi <- summarize_champions_cross_industry(ind_champs)
+          if (nrow(xi$cross_industry) > 0) {
+            write_csv(xi$cross_industry,
+                      file.path(cross_dir, "cross_industry_champion_rollup.csv"))
+          }
+          if (nrow(xi$per_cell) > 0) {
+            write_csv(xi$per_cell,
+                      file.path(cross_dir, "cross_industry_champion_per_cell.csv"))
+          }
+          if (verbose) message("  [OK] Cross-industry champion roll-up")
+        }
+      }, error = function(e) {
+        if (verbose) message(sprintf("  [ERR] Champion roll-up: %s", conditionMessage(e)))
       })
     }
 
@@ -826,13 +990,18 @@ generate_mv_report <- function(industries,
       names(industries)
     )
 
+    # Track is uniform across industries within a single report
+    tracks <- unique(unlist(lapply(industries, function(x) x$track %||% "event")))
+    track_param <- if (length(tracks) == 1) tracks else "event"
+
     quarto::quarto_render(
       input = qmd_template,
       output_file = basename(report_output),
       execute_params = list(
         figure_dir = normalizePath(output_dir),
         manifest   = normalizePath(file.path(output_dir, "_manifest.csv")),
-        industry_labels = paste(names(industry_labels), industry_labels, sep = "=", collapse = ";")
+        industry_labels = paste(names(industry_labels), industry_labels, sep = "=", collapse = ";"),
+        track = track_param
       )
     )
 
