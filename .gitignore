@@ -58,3 +58,10 @@ rsconnect/
 *.parquet
 *.pdf
 *.png
+
+# Analysis outputs (regenerable; shared via Zenodo, not tracked)
+/results_new_new/
+/report_figures_manuscript/
+
+# Local scratch / exploratory (not part of the archived study)
+/attic/

@@ -37,7 +37,48 @@ PANEL_OUTCOME_VARS_AVIATION <- list(
   rate_aids_incidents_only = list(
     var      = "n_aids_incidents",
     offset   = "departures",
-    label    = "AIDS incident rate per departure (incident-only, no accidents)",
+    label    = "AIDS incident rate per departure (incident-only, no accidents) [legacy event_type split]",
+    family   = "nbinom2"
+  ),
+
+  # --- Harm-stratified AIDS detectability ladder (single-corpus; replaces the
+  #     event_type split with the HARM axis). zeroharm is the discretionary
+  #     reporting tier (mining-T0 analog); harm pools injury+fatal for power.
+  #     See aviation/data_prep.R load_aids_panel_rate(). ---
+  rate_aids_noharm = list(
+    var      = "n_aids_noharm",
+    offset   = "departures",
+    label    = "AIDS no-consequence event rate per departure (0 casualty & no substantial damage) [discretionary reporting tier]",
+    family   = "nbinom2"
+  ),
+  rate_aids_propdamage = list(
+    var      = "n_aids_propdamage",
+    offset   = "departures",
+    label    = "AIDS property-damage event rate per departure (0 casualty, substantial/destroyed aircraft)",
+    family   = "nbinom2"
+  ),
+  rate_aids_zeroharm = list(
+    var      = "n_aids_zeroharm",
+    offset   = "departures",
+    label    = "AIDS zero-casualty event rate per departure (0 inj & 0 fat; = noharm+propdamage) [continuity]",
+    family   = "nbinom2"
+  ),
+  rate_aids_injury = list(
+    var      = "n_aids_injury",
+    offset   = "departures",
+    label    = "AIDS non-fatal-injury event rate per departure (injuries>0, fatalities=0)",
+    family   = "nbinom2"
+  ),
+  rate_aids_fatal = list(
+    var      = "n_aids_fatal",
+    offset   = "departures",
+    label    = "AIDS fatal-event rate per departure (fatalities>0)",
+    family   = "nbinom2"
+  ),
+  rate_aids_harm = list(
+    var      = "n_aids_harm",
+    offset   = "departures",
+    label    = "AIDS any-harm event rate per departure (injury OR fatal; pooled for power)",
     family   = "nbinom2"
   ),
 
@@ -61,6 +102,35 @@ PANEL_OUTCOME_VARS_AVIATION <- list(
     var      = "sum_fatalities",
     offset   = "departures",
     label    = "Fatalities per departure (NTSB)",
+    family   = "nbinom2"
+  ),
+
+  # --- NTSB injury-severity EVENT-count ladder (highest-injury per accident) ---
+  # Grades the casualty axis (AIDS cannot: it has no minor/serious split). The
+  # combined serious+fatal historically shows the strongest harm-side effect and
+  # is better powered than fatal alone (see existing rate_inj_serious_fatal).
+  rate_ntsb_minor = list(
+    var      = "n_ntsb_minor",
+    offset   = "departures",
+    label    = "NTSB minor-injury accident rate per departure (highest injury = minor)",
+    family   = "nbinom2"
+  ),
+  rate_ntsb_serious = list(
+    var      = "n_ntsb_serious",
+    offset   = "departures",
+    label    = "NTSB serious-injury accident rate per departure (highest = serious, non-fatal)",
+    family   = "nbinom2"
+  ),
+  rate_ntsb_fatal = list(
+    var      = "n_ntsb_fatal",
+    offset   = "departures",
+    label    = "NTSB fatal accident rate per departure (highest injury = fatal)",
+    family   = "nbinom2"
+  ),
+  rate_ntsb_serious_fatal = list(
+    var      = "n_ntsb_serious_fatal",
+    offset   = "departures",
+    label    = "NTSB serious+fatal accident rate per departure (highest in {serious,fatal}; pooled)",
     family   = "nbinom2"
   )
 )

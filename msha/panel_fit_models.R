@@ -1,24 +1,29 @@
 # =============================================================================
-# nrc/panel_fit_models.R — NRC Panel-Rate Model Fitting
+# msha/panel_fit_models.R — MSHA Panel-Rate Model Fitting
 # =============================================================================
 #
-# Fits negative-binomial GLMM rate models on the facility × quarter panel
-# produced by prepare_nrc_panel_data().
+# Fits negative-binomial / Tweedie GLMM rate models on the mine × quarter panel
+# produced by prepare_msha_panel_data().
 #
 # Model form (template):
-#   outcome ~ CLIMATE_VAR + temporal_controls + power_std_between/within
-#             + offset(log(days_at_power_total)) + (1 | facility_site)
+#   outcome ~ CLIMATE_VAR + yearmonth_num_c + sin_month + cos_month
+#             + hours_within + offset(log(hours_worked)) + (1 | mine_id)
 #
-# Default outcomes:
-#   rate_lers   : n_lers,   offset = log(days_at_power_total)
-#   rate_emerg  : n_emerg,  offset = log(days_at_power_total)
+# Self-reported outcomes:
+#   rate_accidents : n_accidents,   nbinom2
+#   rate_injuries  : n_injuries,    nbinom2
+#   rate_fatal     : n_fatal,       nbinom2
+#   rate_days_lost : sum_days_lost, tweedie
+# Externally-assessed (regulatory) outcomes:
+#   rate_violations : violation_count, nbinom2
+#   rate_ss         : ss_count,        nbinom2
 #
-# capacity_factor is intentionally NOT in the RHS — it equals
-# days_at_power / total_days, so including it alongside log(days_at_power)
-# would be near-collinear. power_std (between/within) IS retained, since
-# it is operational volatility, not exposure.
+# log(hours_worked) is the universal exposure offset. hours_within
+# (within-mine volatility) is the only operational covariate — hours_between is
+# collinear with the offset level and is excluded (mirrors NRC dropping
+# capacity_factor against the days_at_power offset).
 #
-# Requires: nrc/config.R sourced first.
+# Requires: msha/config.R sourced first.
 # Dependencies: glmmTMB, broom.mixed, dplyr
 # =============================================================================
 
@@ -29,62 +34,60 @@ suppressPackageStartupMessages({
 })
 
 
-PANEL_OUTCOME_VARS_NRC <- list(
-  rate_lers = list(
-    var      = "n_lers",
-    offset   = "days_at_power_total",
-    label    = "LER rate per reactor-day at power",
-    family   = "nbinom2"
+PANEL_OUTCOME_VARS_MSHA <- list(
+  rate_accidents = list(
+    var = "n_accidents", offset = "hours_worked", family = "nbinom2",
+    label = "Reported-accident rate per employee-hour"
   ),
-  rate_emerg = list(
-    var      = "n_emerg",
-    offset   = "days_at_power_total",
-    label    = "Emergency-declaration rate per reactor-day at power",
-    family   = "nbinom2"
+  rate_injuries = list(
+    var = "n_injuries", offset = "hours_worked", family = "nbinom2",
+    label = "Injury rate per employee-hour"
   ),
-  rate_scrams = list(
-    var      = "n_scrams",
-    offset   = "days_at_power_total",
-    label    = "Scram rate per reactor-day at power",
-    family   = "nbinom2"
+  rate_fatal = list(
+    var = "n_fatal", offset = "hours_worked", family = "nbinom2",
+    label = "Fatal-accident rate per employee-hour"
   ),
-  rate_pct_power_loss = list(
-    var      = "sum_pct_power_loss",
-    offset   = "days_at_power_total",
-    label    = "Total %-power-loss per reactor-day at power",
-    family   = "tweedie"
+  rate_days_lost = list(
+    var = "sum_days_lost", offset = "hours_worked", family = "tweedie",
+    label = "Lost-workday rate per employee-hour"
   ),
-  # ---- Externally-assessed performance outcomes ----
-  # These complement the self-reported LER-derived measures with NRC's
-  # external inspection / regulatory-oversight judgments.
-  rate_findings_all = list(
-    var      = "findings_count",
-    offset   = "days_at_power_total",
-    label    = "All-color NRC inspection findings per reactor-day at power",
-    family   = "nbinom2"
+  # ---- Detectability tiers (severity-graded reporting filter; see
+  #      injury_detectability_supplemental_design.md §3.1). One rate model per
+  #      tier, identical RHS, so the climate coefficients are comparable. The
+  #      estimand is the ordered vector (beta_T1, beta_T2, beta_T3): the
+  #      hypothesis is monotone-increasing with beta_T1 <= 0 < beta_T3.
+  #      T1 is sparse (~1% of coal events) and unstable as a count -> recast as
+  #      a binary `any_severe` outcome is a planned multiverse level (§6.1).
+  #      rate_t0 (accident-only anchor) is registered but off by default
+  #      (t0_inclusion multiverse switch), like rate_violations/rate_ss. ----
+  rate_t1 = list(
+    var = "n_t1", offset = "hours_worked", family = "nbinom2",
+    label = "Detectability T1 (fatal/permanent-disability) rate per employee-hour"
   ),
-  rate_findings_nongreen = list(
-    var      = "findings_nongreen",
-    offset   = "days_at_power_total",
-    label    = "Non-green (safety-significant) findings per reactor-day at power",
-    family   = "nbinom2"
+  rate_t2 = list(
+    var = "n_t2", offset = "hours_worked", family = "nbinom2",
+    label = "Detectability T2 (lost-time) rate per employee-hour"
   ),
-  # Probability outcome — binomial, NO offset (one Bernoulli draw per
-  # facility-quarter). NA rows (quarters with no assessment) are dropped at
-  # fit time.
-  prob_above_col1 = list(
-    var      = "above_col1",
-    offset   = NULL,
-    label    = "Probability of NRC Action Matrix Column >= 2 (above baseline)",
-    family   = "binomial"
+  rate_t3 = list(
+    var = "n_t3", offset = "hours_worked", family = "nbinom2",
+    label = "Detectability T3 (minor/discretionary) rate per employee-hour"
+  ),
+  rate_t0 = list(
+    var = "n_t0", offset = "hours_worked", family = "nbinom2",
+    label = "Detectability T0 (accident-only / no-injury) rate per employee-hour"
+  ),
+  # ---- Externally-assessed (regulatory) outcomes ----
+  rate_violations = list(
+    var = "violation_count", offset = "hours_worked", family = "nbinom2",
+    label = "MSHA citation/violation rate per employee-hour"
+  ),
+  rate_ss = list(
+    var = "ss_count", offset = "hours_worked", family = "nbinom2",
+    label = "Significant-and-substantial violation rate per employee-hour"
   )
 )
 
 
-#' Resolve a glmmTMB family object from a string family name.
-#'
-#' @param family_str One of "nbinom2", "tweedie", "poisson".
-#' @return A glmmTMB family object.
 .resolve_panel_family <- function(family_str) {
   switch(family_str,
     nbinom2  = glmmTMB::nbinom2(),
@@ -96,42 +99,32 @@ PANEL_OUTCOME_VARS_NRC <- list(
   )
 }
 
-
-#' Extract Tweedie variance power from a fitted glmmTMB model, or NA.
 .extract_tweedie_power <- function(fit) {
   tryCatch({
     par <- fit$fit$parfull
     psi <- par[names(par) == "psi"]
     if (length(psi) == 0) return(NA_real_)
-    # glmmTMB parameterization: p = 1 + plogis(psi), p in (1,2)
     1 + plogis(unname(psi[1]))
   }, error = function(e) NA_real_)
 }
 
 
-#' Build the formula for an NRC panel-rate model.
+#' Build the formula for an MSHA panel-rate model.
 #'
-#' Includes power_std between/within (operational volatility), temporal
-#' controls, and a log(exposure) offset. Random intercept on facility_site.
-#'
-#' @param outcome Key in PANEL_OUTCOME_VARS_NRC.
+#' @param outcome Key in PANEL_OUTCOME_VARS_MSHA.
 #' @param climate_var Name of the climate variable column.
-#' @param re_term Random effect spec (default "(1 | facility_site)").
+#' @param re_term Random effect spec (default "(1 | mine_id)").
 #' @return A formula object.
-build_nrc_panel_formula <- function(outcome, climate_var,
-                                    re_term = "(1 | facility_site)") {
-  cfg <- PANEL_OUTCOME_VARS_NRC[[outcome]]
+build_msha_panel_formula <- function(outcome, climate_var,
+                                     re_term = "(1 | mine_id)") {
+  cfg <- PANEL_OUTCOME_VARS_MSHA[[outcome]]
   if (is.null(cfg)) stop("Unknown panel outcome: ", outcome)
-
-  bw_terms <- c("power_std_mean_between", "power_std_mean_within")
 
   rhs_parts <- c(
     climate_var,
     "yearmonth_num_c", "sin_month", "cos_month",
-    bw_terms
+    "hours_within"
   )
-  # Binomial outcomes have no natural exposure offset — each facility-quarter
-  # is one Bernoulli draw.
   if (!is.null(cfg$offset)) {
     rhs_parts <- c(rhs_parts, sprintf("offset(log(%s))", cfg$offset))
   }
@@ -141,31 +134,32 @@ build_nrc_panel_formula <- function(outcome, climate_var,
 }
 
 
-#' Fit one NRC panel-rate GLMM.
+#' Fit one MSHA panel-rate GLMM.
 #'
-#' @param data Panel data frame from prepare_nrc_panel_data().
+#' @param data Panel data frame from prepare_msha_panel_data().
 #' @param climate_var Name of the climate variable column to use.
 #' @param config_id Configuration ID for tracking.
-#' @param outcome Key in PANEL_OUTCOME_VARS_NRC.
-#' @param family glmmTMB family. Default: nbinom2.
+#' @param outcome Key in PANEL_OUTCOME_VARS_MSHA.
+#' @param family glmmTMB family. Default resolved from the outcome spec.
 #' @return Named list with model coefficients, fit stats, and convergence flag.
-fit_single_nrc_panel_model <- function(data, climate_var, config_id,
-                                       outcome = "rate_lers",
-                                       family = NULL) {
+fit_single_msha_panel_model <- function(data, climate_var, config_id,
+                                        outcome = "rate_accidents",
+                                        family = NULL) {
 
-  cfg <- PANEL_OUTCOME_VARS_NRC[[outcome]]
+  cfg <- PANEL_OUTCOME_VARS_MSHA[[outcome]]
   if (is.null(cfg)) stop("Unknown panel outcome: ", outcome)
   if (is.null(family)) family <- .resolve_panel_family(cfg$family %||% "nbinom2")
 
   outcome_var <- cfg$var
-  exposure    <- cfg$offset    # may be NULL for binomial
+  exposure    <- cfg$offset
   has_offset  <- !is.null(exposure)
-  bw_cols     <- c("power_std_mean_between", "power_std_mean_within")
+  bw_cols     <- c("hours_within")
+  is_count    <- (cfg$family %||% "nbinom2") %in% c("nbinom2", "nbinom1", "poisson")
 
   required_cols <- c(climate_var, outcome_var,
                      if (has_offset) exposure else character(0),
                      "yearmonth_num_c", "sin_month", "cos_month",
-                     "facility_site", bw_cols)
+                     "mine_id", bw_cols)
   missing <- setdiff(required_cols, names(data))
   if (length(missing) > 0) {
     return(list(
@@ -181,13 +175,14 @@ fit_single_nrc_panel_model <- function(data, climate_var, config_id,
       !is.na(.data[[climate_var]]),
       !is.na(.data[[outcome_var]]),
       !is.na(yearmonth_num_c), !is.na(sin_month), !is.na(cos_month),
-      !is.na(facility_site),
+      !is.na(mine_id),
       if_all(all_of(bw_cols), ~ !is.na(.x))
     )
   if (has_offset) {
-    d <- d %>%
-      filter(!is.na(.data[[exposure]]), .data[[exposure]] > 0)
+    d <- d %>% filter(!is.na(.data[[exposure]]), .data[[exposure]] > 0)
   }
+  # Count families require integer responses.
+  if (is_count) d[[outcome_var]] <- as.integer(round(d[[outcome_var]]))
 
   if (nrow(d) < 100) {
     return(list(
@@ -207,7 +202,7 @@ fit_single_nrc_panel_model <- function(data, climate_var, config_id,
     ))
   }
 
-  fml <- build_nrc_panel_formula(outcome, climate_var)
+  fml <- build_msha_panel_formula(outcome, climate_var)
   message("Panel formula: ", deparse1(fml))
 
   res <- tryCatch({
@@ -239,7 +234,7 @@ fit_single_nrc_panel_model <- function(data, climate_var, config_id,
       BIC       = BIC(fit),
       logLik    = as.numeric(logLik(fit)),
       n_obs     = nrow(d),
-      n_orgs    = n_distinct(d$facility_site),
+      n_orgs    = n_distinct(d$mine_id),
       n_periods = n_distinct(d$quarter_start),
       n_zero_outcome   = sum(d[[outcome_var]] == 0),
       pct_zero_outcome = 100 * mean(d[[outcome_var]] == 0),

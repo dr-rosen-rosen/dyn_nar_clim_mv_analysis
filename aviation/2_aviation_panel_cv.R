@@ -39,23 +39,31 @@ NTSB_POST_PATH <- here("data/aviation/ntsb_av_accident_data/events.xlsx")
 NTSB_PRE_PATH  <- here("data/aviation/ntsb_av_accident_data/events_pre2008.xlsx")
 OPS_PATH       <- here("data/aviation/bts_t100/airport_month_ops.parquet")
 
-OUTPUT_PATH <- "results_new_new/aviation/panel_cv_results.parquet"
+# Run isolation (defaults preserve original behavior). Override via env:
+#   AV_MV_TAG=harm_ladder -> panel_cv_results_harm_ladder.parquet
+#   AV_MV_OUTCOMES=a,b,c   -> restrict outcomes (comma-separated)
+RUN_TAG  <- Sys.getenv("AV_MV_TAG", "")
+.tag_sfx <- if (nzchar(RUN_TAG)) paste0("_", RUN_TAG) else ""
+OUTPUT_PATH <- sprintf("results_new_new/aviation/panel_cv_results%s.parquet", .tag_sfx)
 N_WORKERS   <- 20L
 
 # PRIMARY outer spec (must match the multiverse driver)
-ATC_SCOPE       <- "local_terminal"
-APT_DIST_NM     <- 5L
+# Primary spec is local_terminal (tower+TRACON) / 5 NM. Override via env for
+# robustness variants, e.g. AV_ATC_SCOPE=local (tower-only) or AV_APT_DIST_NM=15.
+ATC_SCOPE       <- { e <- Sys.getenv("AV_ATC_SCOPE", "");   if (nzchar(e)) e else "local_terminal" }
+APT_DIST_NM     <- { e <- suppressWarnings(as.integer(Sys.getenv("AV_APT_DIST_NM",""))); if (is.na(e)) 5L else e }
 MISSING_CLIMATE <- "exclude"
+AV_PERIOD <- { e <- Sys.getenv("AV_PERIOD", ""); if (e %in% c("month","quarter")) e else "month" }
 
 
 # --- Load data ---
 asrs_meta    <- load_asrs_meta_panel(ASRS_PARQUET_PATH)
 ops_features <- read_parquet(OPS_PATH)
 ntsb_panel   <- load_ntsb_panel_rate(NTSB_POST_PATH, NTSB_PRE_PATH,
-                                      apt_dist_nm = APT_DIST_NM)
+                                      apt_dist_nm = APT_DIST_NM, period = AV_PERIOD)
 aids_panel   <- load_aids_panel_rate(AIDS_PARQUET_PATH,
                                       apt_dist_nm = APT_DIST_NM,
-                                      min_year = 1988L)
+                                      min_year = 1988L, period = AV_PERIOD)
 
 
 # --- Panel prep closure ---
@@ -69,7 +77,8 @@ panel_data_fn <- function(parquet_path, config_id) {
     aids_panel_df    = aids_panel,
     atc_scope        = ATC_SCOPE,
     missing_climate  = MISSING_CLIMATE,
-    min_reports      = MIN_REPORTS_DEFAULT
+    min_reports      = MIN_REPORTS_DEFAULT,
+    period           = AV_PERIOD
   )
 }
 
@@ -89,6 +98,37 @@ outcome_specs <- list(
     family = "nbinom2", bw_terms = .av_bw,
     org_var = "airport_id", period_date_var = "yearmonth"
   ),
+  # Consequence (harm x damage) detectability ladder (see panel_fit_models.R / data_prep.R)
+  rate_aids_noharm = list(
+    outcome_var = "n_aids_noharm", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_aids_propdamage = list(
+    outcome_var = "n_aids_propdamage", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_aids_zeroharm = list(
+    outcome_var = "n_aids_zeroharm", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_aids_injury = list(
+    outcome_var = "n_aids_injury", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_aids_fatal = list(
+    outcome_var = "n_aids_fatal", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_aids_harm = list(
+    outcome_var = "n_aids_harm", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
   rate_accidents = list(
     outcome_var = "n_accidents", exposure = "departures",
     family = "nbinom2", bw_terms = .av_bw,
@@ -103,8 +143,35 @@ outcome_specs <- list(
     outcome_var = "sum_fatalities", exposure = "departures",
     family = "nbinom2", bw_terms = .av_bw,
     org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  # NTSB injury-severity event-count ladder (see panel_fit_models.R / panel_data_prep.R)
+  rate_ntsb_minor = list(
+    outcome_var = "n_ntsb_minor", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_ntsb_serious = list(
+    outcome_var = "n_ntsb_serious", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_ntsb_fatal = list(
+    outcome_var = "n_ntsb_fatal", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
+  ),
+  rate_ntsb_serious_fatal = list(
+    outcome_var = "n_ntsb_serious_fatal", exposure = "departures",
+    family = "nbinom2", bw_terms = .av_bw,
+    org_var = "airport_id", period_date_var = "yearmonth"
   )
 )
+# Optional outcome restriction (comma-separated keys of outcome_specs).
+.oc_override <- Sys.getenv("AV_MV_OUTCOMES", "")
+if (nzchar(.oc_override)) {
+  .keep <- trimws(strsplit(.oc_override, ",")[[1]])
+  outcome_specs <- outcome_specs[intersect(.keep, names(outcome_specs))]
+}
 
 
 # --- Run ---

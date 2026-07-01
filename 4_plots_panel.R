@@ -50,12 +50,31 @@ industries <- list(
 # Uses the PRIMARY outer spec (atc_scope=local_terminal × apt_dist_nm=5 × exclude).
 # Other outer-spec combinations are sensitivity-only.
 industries$aviation <- industry_config(
-  mv_results      = "results_new_new/aviation/panel_mv_results.parquet",
-  cv_results      = "results_new_new/aviation/panel_cv_results.parquet",
-  config_registry = "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/asrs_04-29-2026/config_registry.csv",
+  mv_results      = "results_new_new/aviation/panel_mv_results_quarterly.parquet",
+  cv_results      = "results_new_new/aviation/panel_cv_results_quarterly.parquet",
+  config_registry = "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/asrs_05-01-2026/config_registry.csv",
   label           = "Aviation (NTSB/ASRS)",
   decision_vars   = c("window_type","window_size","lag_days","embedding_model","sent_method","comp__method"),
   ops_vars        = c("seats", "passengers"),  # departures is the offset
+  cv_filter_baseline = "seasonal_ops",
+  cv_filter_require_both = FALSE,
+  cv_filter_level = "config_window",
+  track = "panel"
+)
+
+
+# --- MSHA (coal) ---
+# Fourth industry arm. Coal only (mnm deferred to the PHMSA follow-up). Outer
+# loop on commodity in the driver writes panel_{mv,cv}_results_coal.parquet.
+# Offset is log(hours_worked); only hours_within enters (between is collinear
+# with the offset level). Champions land in report_figures_panel/msha/.
+industries$msha <- industry_config(
+  mv_results      = "results_new_new/msha/panel_mv_results_coal_detectability_full.parquet",
+  cv_results      = "results_new_new/msha/panel_cv_results_coal_detectability_full.parquet",
+  config_registry = "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/msha_06-01-2026/config_registry.csv",
+  label           = "Mining (MSHA coal)",
+  decision_vars   = c("window_type","window_size","lag_days","embedding_model","sent_method","comp__method"),
+  ops_vars        = c("hours"),  # hours_worked is the offset; hours_within decomposed
   cv_filter_baseline = "seasonal_ops",
   cv_filter_require_both = FALSE,
   cv_filter_level = "config_window",

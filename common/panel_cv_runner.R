@@ -82,6 +82,12 @@ score_panel_holdout <- function(fit, newdata, outcome_var) {
       tweedie::dtweedie(y, mu = mu, phi = phi, power = p_var) %>%
         pmax(.Machine$double.xmin) %>% log()
     },
+    binomial = {
+      # mu is the predicted probability; y is 0/1 (or 0..n if grouped).
+      # For Bernoulli (one trial per row): dbinom(y, 1, mu).
+      mu <- pmin(pmax(mu, .Machine$double.xmin), 1 - .Machine$double.xmin)
+      dbinom(y, size = 1L, prob = mu, log = TRUE)
+    },
     {
       warning(glue("score_panel_holdout: unsupported family '{fam}', ",
                    "falling back to Gaussian density."))
@@ -126,7 +132,8 @@ score_panel_holdout <- function(fit, newdata, outcome_var) {
 build_panel_cv_formulas <- function(outcome_var, exposure, climate_var,
                                     bw_terms, org_var,
                                     data_names = NULL) {
-  off <- sprintf("offset(log(%s))", exposure)
+  has_offset <- !is.null(exposure) && nzchar(exposure)
+  off <- if (has_offset) sprintf("offset(log(%s))", exposure) else NULL
   re  <- sprintf("(1 | %s)", org_var)
 
   # Optional temporal/seasonal terms — included only if the panel actually has
@@ -145,10 +152,22 @@ build_panel_cv_formulas <- function(outcome_var, exposure, climate_var,
     ops_chunk
   }
 
-  intercept <- paste(outcome_var, "~", off, "+", re)
-  seasonal  <- paste(outcome_var, "~", rhs_seasonal_ops, "+", off, "+", re)
-  climate   <- paste(outcome_var, "~", climate_var, "+",
-                     rhs_seasonal_ops, "+", off, "+", re)
+  # Concatenate with offset only when present (binomial outcomes have none).
+  join_rhs <- function(parts) {
+    parts <- parts[!vapply(parts, is.null, logical(1)) &
+                     nzchar(unlist(parts))]
+    paste(unlist(parts), collapse = " + ")
+  }
+
+  intercept <- paste(outcome_var, "~", join_rhs(list(off, re)))
+  seasonal  <- paste(outcome_var, "~",
+                      join_rhs(list(rhs_seasonal_ops, off, re)))
+  climate   <- paste(outcome_var, "~",
+                      join_rhs(list(climate_var, rhs_seasonal_ops, off, re)))
+  # Intercept-only must have at least "1" if there's no offset.
+  if (!has_offset) {
+    intercept <- paste(outcome_var, "~", join_rhs(list("1", re)))
+  }
   list(intercept_only = intercept, seasonal_ops = seasonal, climate = climate)
 }
 
@@ -182,11 +201,14 @@ panel_cv_group_kfold <- function(data, formula_str, outcome_var, exposure,
   data$.org <- data[[org_var]]
   data <- data %>% left_join(fold_map, by = ".org")
 
+  has_offset <- !is.null(exposure) && nzchar(exposure)
   rows <- vector("list", K)
   for (k in seq_len(K)) {
     train <- data %>% filter(fold != k)
-    test  <- data %>% filter(fold == k, .data[[exposure]] > 0,
-                             !is.na(.data[[outcome_var]]))
+    test  <- data %>% filter(fold == k, !is.na(.data[[outcome_var]]))
+    if (has_offset) {
+      test <- test %>% filter(.data[[exposure]] > 0)
+    }
     if (nrow(test) < min_test_rows || sum(test[[outcome_var]] > 0) == 0) {
       rows[[k]] <- tibble(fold = k, status = "empty_test",
                           model_label = model_label)
@@ -280,14 +302,17 @@ panel_cv_timeseries <- function(data, formula_str, outcome_var, exposure,
     return(list(split_results = tibble(), summary = NULL))
   }
 
+  has_offset <- !is.null(exposure) && nzchar(exposure)
   rows <- vector("list", length(cutpoints))
   for (i in seq_along(cutpoints)) {
     cp <- cutpoints[[i]]
     train <- data %>% filter(period_date <= cp$train_end)
     test  <- data %>% filter(period_date >= cp$test_start,
                              period_date <= cp$test_end,
-                             .data[[exposure]] > 0,
                              !is.na(.data[[outcome_var]]))
+    if (has_offset) {
+      test <- test %>% filter(.data[[exposure]] > 0)
+    }
     if (nrow(train) < min_train_rows || nrow(test) < min_test_rows ||
         sum(test[[outcome_var]] > 0) == 0) {
       rows[[i]] <- tibble(split = cp$split, status = "insufficient_data",
@@ -341,6 +366,11 @@ panel_cv_timeseries <- function(data, formula_str, outcome_var, exposure,
         phi <- glmmTMB::sigma(fit)
         log(pmax(tweedie::dtweedie(y_ok, mu = mu_ok, phi = phi, power = p_var),
                  .Machine$double.xmin))
+      },
+      binomial = {
+        mu_clamp <- pmin(pmax(mu_ok, .Machine$double.xmin),
+                          1 - .Machine$double.xmin)
+        dbinom(y_ok, size = 1L, prob = mu_clamp, log = TRUE)
       },
       {
         sd_r <- sd(residuals(fit), na.rm = TRUE)
@@ -411,18 +441,24 @@ run_panel_cv_for_outcome <- function(panel, outcome_var, exposure,
                                       min_test_rows_timeseries = 20L,
                                       seed = 42L) {
 
+  has_offset <- !is.null(exposure) && nzchar(exposure)
+
   fmls <- build_panel_cv_formulas(outcome_var, exposure, climate_var,
                                   bw_terms, org_var,
                                   data_names = names(panel))
 
   # Filter to complete cases for the climate formula (most permissive: needs
   # everything). All tiers use the same data slice for fair comparison.
-  required <- c(outcome_var, exposure, climate_var,
+  required <- c(outcome_var,
+                if (has_offset) exposure else character(0),
+                climate_var,
                 "yearmonth_num_c", "sin_month", "cos_month",
                 bw_terms, org_var)
   d <- panel %>% filter(if_all(all_of(intersect(required, names(panel))),
-                                ~ !is.na(.x)),
-                         .data[[exposure]] > 0)
+                                ~ !is.na(.x)))
+  if (has_offset) {
+    d <- d %>% filter(.data[[exposure]] > 0)
+  }
 
   # Provide a `period_date` alias for timeseries CV.
   if (!is.null(period_date_var) && period_date_var %in% names(d)) {

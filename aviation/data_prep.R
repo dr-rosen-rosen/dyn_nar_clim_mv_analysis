@@ -125,7 +125,8 @@ load_asrs_meta <- function(asrs_csv_path) {
 #'   n_aids_incidents. One row per airport-month with at least one AIDS event.
 load_aids_panel_rate <- function(aids_parquet_path,
                                   apt_dist_nm = 5L,
-                                  min_year    = 1988L) {
+                                  min_year    = 1988L,
+                                  period      = "month") {
 
   message(sprintf("  Loading AIDS data (apt_dist <= %d NM, min_year = %s)...",
                   apt_dist_nm,
@@ -153,13 +154,42 @@ load_aids_panel_rate <- function(aids_parquet_path,
     filter(on_airport |
              (!on_airport & !is.na(apt_dist_nm) & apt_dist_nm <= !!apt_dist_nm))
 
+  # Harm + damage detectability ladder (single-corpus, mirrors the mining
+  # DEGREE_INJURY tiers). The CONSEQUENCE axis — not event_type — is the right
+  # cut: the legacy event_type split mislabels it (AIDS "accidents" are 96%
+  # substantial/destroyed damage; "incidents" are ~90% minor/none). Per-event
+  # AIDS fields: total_fatalities, total_injuries, substantial_damage (1 =
+  # substantial OR destroyed aircraft; from aids_data_pipeline.py c98).
+  #   noharm    : 0 casualty & NOT substantial damage -> discretionary reporting tier (T0 analog)
+  #   propdamage: 0 casualty & substantial/destroyed  -> hull/property tier (high detectability, no casualty)
+  #   zeroharm  : 0 casualty (= noharm + propdamage)   -> retained for continuity
+  #   injury    : injuries>0, fatalities=0             -> non-fatal casualty
+  #   fatal     : fatalities>0                         -> sparse extreme harm
+  #   harm      : injury OR fatal (pooled)             -> estimable casualty tier (power)
+  # Defensive: older parquets may predate the damage field -> treat as not-substantial.
+  if (!"substantial_damage" %in% names(aids)) aids$substantial_damage <- 0L
+  aids <- aids %>%
+    mutate(
+      .fat   = pmax(0, suppressWarnings(as.numeric(total_fatalities)), na.rm = TRUE),
+      .inj   = pmax(0, suppressWarnings(as.numeric(total_injuries)),   na.rm = TRUE),
+      .subst = coalesce(suppressWarnings(as.integer(substantial_damage)), 0L)
+    )
+
   panel <- aids %>%
-    mutate(yearmonth = lubridate::floor_date(event_date, "month")) %>%
+    mutate(yearmonth = lubridate::floor_date(
+             event_date, unit = if (period == "quarter") "quarter" else "month")) %>%
     group_by(airport_id, yearmonth) %>%
     summarise(
       n_aids_all       = n(),
       n_aids_accidents = sum(event_type == "accident", na.rm = TRUE),
       n_aids_incidents = sum(event_type == "incident", na.rm = TRUE),
+      # consequence ladder (harm x damage)
+      n_aids_noharm    = sum(.fat == 0 & .inj == 0 & .subst == 0, na.rm = TRUE),
+      n_aids_propdamage= sum(.fat == 0 & .inj == 0 & .subst == 1, na.rm = TRUE),
+      n_aids_zeroharm  = sum(.fat == 0 & .inj == 0,               na.rm = TRUE),
+      n_aids_injury    = sum(.inj > 0 & .fat == 0,                na.rm = TRUE),
+      n_aids_fatal     = sum(.fat > 0,                            na.rm = TRUE),
+      n_aids_harm      = sum(.inj > 0 | .fat > 0,                 na.rm = TRUE),
       .groups = "drop"
     )
 
@@ -185,11 +215,40 @@ load_aids_panel_rate <- function(aids_parquet_path,
 #' both `eid` (for joining to scores) and `raw_event_id` (original ACN, kept
 #' for traceability), plus the standard fields the panel needs.
 #'
+#' Important: ASRS changed its location-encoding convention in 1999. Pre-1999
+#' reports use bare FAA airport codes (e.g. "ATL", "JFK"); from 1999 onward
+#' reports are tagged with a facility-type suffix indicating which controller
+#' perspective generated them: ".AIRPORT" (events at/near the airport),
+#' ".TOWER" (local-tower controller), ".TRACON" (terminal radar approach
+#' control covering multiple airports), ".ARTCC" (en-route center).
+#'
+#' For the airport × month panel-rate analysis we need stable airport-level
+#' identifiers that join cleanly to BTS T-100 (which uses bare FAA codes).
+#' This function therefore:
+#'
+#'   1. Strips ".AIRPORT" and ".TOWER" suffixes — both refer to the same
+#'      physical airport, so we merge them with the pre-1999 bare codes.
+#'   2. Drops ".TRACON", ".ARTCC", and other non-airport facility identifiers.
+#'      Those reports are from a different operational layer (radar / en-route
+#'      controllers serving multiple airports) and shouldn't be folded into
+#'      an airport-level safety-climate panel.
+#'   3. Drops the placeholder "ZZZ" airport (used when location is unknown).
+#'
+#' Without this normalization step the panel pipeline silently restricts the
+#' analysis to pre-1999 data because only bare codes match BTS.
+#'
 #' @param events_parquet_path Path to processed/aviation/events.parquet
 #'   (output of dynclim/data/aviation_data_pipeline.py)
-#' @return Tibble: eid, raw_event_id, airport_id, event_date, atc_local,
-#'   atc_terminal, atc_enroute, atc_any
-load_asrs_meta_panel <- function(events_parquet_path) {
+#' @param keep_facility_types Character vector of suffixes to keep, after
+#'   uppercasing. Default c("AIRPORT", "TOWER", "") — bare codes and airport-
+#'   level controller perspectives. Other entries are dropped. Pass NULL to
+#'   keep everything (legacy behavior; not recommended for panel analysis).
+#' @return Tibble: eid, raw_event_id, airport_id (normalized to bare FAA
+#'   code), facility_type (one of "BARE", "AIRPORT", "TOWER", "TRACON",
+#'   "ARTCC", "OTHER" — kept for traceability), event_date, atc_local,
+#'   atc_terminal, atc_enroute, atc_any.
+load_asrs_meta_panel <- function(events_parquet_path,
+                                   keep_facility_types = c("BARE", "AIRPORT", "TOWER")) {
 
   message(sprintf("  Loading ASRS metadata from %s ...",
                   basename(events_parquet_path)))
@@ -201,13 +260,48 @@ load_asrs_meta_panel <- function(events_parquet_path) {
                     "reporter_function"))) %>%
     rename(airport_id = airport) %>%
     mutate(
-      eid           = as.character(eid),
-      raw_event_id  = as.character(raw_event_id),
-      airport_id    = str_to_upper(str_trim(as.character(airport_id))),
-      airport_id    = na_if(airport_id, ""),
-      airport_id    = na_if(airport_id, "NA"),
-      event_date    = as.Date(event_date)
+      eid              = as.character(eid),
+      raw_event_id     = as.character(raw_event_id),
+      airport_id_raw   = str_to_upper(str_trim(as.character(airport_id))),
+      airport_id_raw   = na_if(airport_id_raw, ""),
+      airport_id_raw   = na_if(airport_id_raw, "NA"),
+      event_date       = as.Date(event_date)
     )
+
+  # ---- Normalize airport_id and tag facility type ----
+  # Strip recognized suffixes; everything before the first "." is the FAA
+  # code (or the bare entry, if no dot).
+  raw <- raw %>%
+    mutate(
+      facility_type = case_when(
+        is.na(airport_id_raw)                            ~ NA_character_,
+        str_detect(airport_id_raw, "\\.AIRPORT$")       ~ "AIRPORT",
+        str_detect(airport_id_raw, "\\.TOWER$")         ~ "TOWER",
+        str_detect(airport_id_raw, "\\.TRACON$")        ~ "TRACON",
+        str_detect(airport_id_raw, "\\.ARTCC$")         ~ "ARTCC",
+        str_detect(airport_id_raw, "\\.")                ~ "OTHER",
+        TRUE                                              ~ "BARE"
+      ),
+      # Bare FAA code: take everything before the first "."
+      airport_id = if_else(is.na(airport_id_raw),
+                            NA_character_,
+                            str_remove(airport_id_raw, "\\..*$"))
+    )
+
+  n_before <- nrow(raw)
+  if (!is.null(keep_facility_types)) {
+    raw <- raw %>% filter(facility_type %in% keep_facility_types)
+  }
+  # Always drop the ZZZ placeholder (unknown location)
+  raw <- raw %>% filter(airport_id != "ZZZ" | is.na(airport_id))
+
+  message(sprintf(
+    "  Facility-type filter: kept %s of %s reports (%.1f%%); types kept: %s",
+    format(nrow(raw), big.mark = ","),
+    format(n_before, big.mark = ","),
+    100 * nrow(raw) / n_before,
+    paste(keep_facility_types, collapse = ", ")
+  ))
 
   is_any_of <- function(col, targets) {
     purrr::map_lgl(str_split(col, ";\\s*"),
@@ -221,7 +315,7 @@ load_asrs_meta_panel <- function(events_parquet_path) {
       atc_enroute  = is_any_of(reporter_function, ATC_FUNCTIONS_ENROUTE),
       atc_any      = atc_local | atc_terminal | atc_enroute
     ) %>%
-    select(eid, raw_event_id, airport_id, event_date,
+    select(eid, raw_event_id, airport_id, facility_type, event_date,
            atc_local, atc_terminal, atc_enroute, atc_any) %>%
     filter(!is.na(event_date), !is.na(airport_id))
 
@@ -231,6 +325,9 @@ load_asrs_meta_panel <- function(events_parquet_path) {
     format(sum(raw$atc_any), big.mark = ","),
     100 * mean(raw$atc_any)
   ))
+  message(sprintf("  Date range: %s -- %s",
+                   as.character(min(raw$event_date, na.rm = TRUE)),
+                   as.character(max(raw$event_date, na.rm = TRUE))))
 
   raw
 }

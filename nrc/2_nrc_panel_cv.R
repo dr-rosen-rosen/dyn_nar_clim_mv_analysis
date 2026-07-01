@@ -30,6 +30,8 @@ source("common/panel_cv_runner.R")
 CFG_DIR     <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/nrc_04-14-2026"
 EVENTS_PATH <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/processed/nrc/events.parquet"
 OPS_PATH    <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/processed/nrc/power_status_quarterly.parquet/power_status_quarterly.parquet"
+FINDINGS_PATH      <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/processed/nrc/findings_quarterly.parquet"
+ACTION_MATRIX_PATH <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/processed/nrc/action_matrix_long.parquet"
 OUTPUT_PATH <- "results_new_new/nrc/panel_cv_results.parquet"
 N_WORKERS   <- 20L
 
@@ -40,13 +42,19 @@ nrc_events <- arrow::read_parquet(EVENTS_PATH) %>%
          eid = as.character(event_num))
 ops_raw <- arrow::read_parquet(OPS_PATH) %>%
   mutate(quarter_start = as.Date(quarter_start))
+findings_raw <- arrow::read_parquet(FINDINGS_PATH) %>%
+  mutate(quarter_start = as.Date(quarter_start))
+action_matrix_raw <- arrow::read_parquet(ACTION_MATRIX_PATH) %>%
+  mutate(quarter_start = as.Date(quarter_start))
 
 
 # --- Panel prep closure ---
 panel_data_fn <- function(parquet_path, config_id) {
   prepare_nrc_panel_data(parquet_path, config_id, nrc_events,
-                          ops_raw = ops_raw,
-                          min_reports = MIN_REPORTS_DEFAULT)
+                          ops_raw          = ops_raw,
+                          findings_df      = findings_raw,
+                          action_matrix_df = action_matrix_raw,
+                          min_reports      = MIN_REPORTS_DEFAULT)
 }
 
 
@@ -73,6 +81,21 @@ outcome_specs <- list(
     outcome_var = "sum_pct_power_loss", exposure = "days_at_power_total",
     family = "tweedie", bw_terms = .nrc_bw,
     org_var = "facility_site", period_date_var = "quarter_start"
+  ),
+  rate_findings_all = list(
+    outcome_var = "findings_count", exposure = "days_at_power_total",
+    family = "nbinom2", bw_terms = .nrc_bw,
+    org_var = "facility_site", period_date_var = "quarter_start"
+  ),
+  rate_findings_nongreen = list(
+    outcome_var = "findings_nongreen", exposure = "days_at_power_total",
+    family = "nbinom2", bw_terms = .nrc_bw,
+    org_var = "facility_site", period_date_var = "quarter_start"
+  ),
+  prob_above_col1 = list(
+    outcome_var = "above_col1", exposure = NULL,   # binomial — no offset
+    family = "binomial", bw_terms = .nrc_bw,
+    org_var = "facility_site", period_date_var = "quarter_start"
   )
 )
 
@@ -98,9 +121,11 @@ results <- run_panel_cv(
     "common/panel_cv_runner.R"
   ),
   worker_globals = list(
-    nrc_events = nrc_events,
-    ops_raw    = ops_raw,
-    panel_data_fn = panel_data_fn
+    nrc_events        = nrc_events,
+    ops_raw           = ops_raw,
+    findings_raw      = findings_raw,
+    action_matrix_raw = action_matrix_raw,
+    panel_data_fn     = panel_data_fn
   )
 )
 

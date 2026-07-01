@@ -215,7 +215,23 @@ run_panel_multiverse <- function(cfg_dir,
   ),
   .progress = TRUE)
 
-  combined <- bind_rows(results)
+  # Assemble the full output. On a RESUMED run, `results` holds only the configs
+  # processed THIS session (the `remaining` set); configs completed in earlier
+  # sessions live only in checkpoint files. Re-read ALL checkpoints so those are
+  # not silently dropped from the combined output, then union in any freshly-run
+  # configs whose checkpoint write happened to fail.
+  if (!is.null(checkpoint_dir)) {
+    cp_files <- list.files(checkpoint_dir, pattern = "\\.parquet$", full.names = TRUE)
+    from_cp  <- if (length(cp_files)) {
+      map_dfr(cp_files, ~ as_tibble(arrow::read_parquet(.x)))
+    } else tibble::tibble()
+    ran <- bind_rows(results)
+    combined <- if (nrow(from_cp) > 0) {
+      bind_rows(from_cp, dplyr::anti_join(ran, from_cp, by = "config_id"))
+    } else ran
+  } else {
+    combined <- bind_rows(results)
+  }
   elapsed <- difftime(Sys.time(), start_time, units = "mins")
 
   message(glue("\nCompleted in {round(as.numeric(elapsed), 1)} minutes"))

@@ -26,6 +26,83 @@ library(patchwork)
 
 
 # ==============================================================================
+# CENTRAL OUTCOME LABELS (single source of truth for figure/table labels)
+# ==============================================================================
+# Descriptive mining labels (not T0-T3 tier codes); AIDS/NTSB acronym casing
+# preserved (default title-case would render "AIDS" as "Aids").
+OUTCOME_LABELS <- c(
+  rate_accidents = "Accidents", rate_injuries = "Injuries", rate_fatalities = "Fatalities",
+  rate_lers = "Licensee event reports", rate_emerg = "Emergency declarations",
+  rate_scrams = "Scrams", rate_pct_power_loss = "Percent power loss",
+  rate_aids_noharm = "No-harm events (AIDS)", rate_aids_propdamage = "Property-damage events (AIDS)",
+  rate_ntsb_serious_fatal = "Serious/fatal accidents (NTSB)", rate_ntsb_fatal = "Fatal accidents (NTSB)",
+  rate_ntsb_serious = "Serious-injury accidents (NTSB)", rate_ntsb_minor = "Minor-injury accidents (NTSB)",
+  rate_aids_all = "All events (AIDS)", rate_aids_incidents_only = "Incidents (AIDS)",
+  rate_aids_injury = "Injury events (AIDS)", rate_aids_harm = "Any-harm events (AIDS)",
+  rate_inj_serious_fatal = "Serious+fatal injuries (NTSB)",
+  rate_t0 = "No-injury reports", rate_t1 = "Severe injury (fatal/disability)",
+  rate_t2 = "Lost-time injury", rate_t3 = "Minor injury", rate_days_lost = "Lost workdays",
+  rate_fatal = "Fatalities", rate_violations = "Citations/violations", rate_ss = "S&S violations"
+)
+pretty_outcome <- function(outcome) {
+  out <- unname(OUTCOME_LABELS[outcome])
+  miss <- is.na(out)
+  if (any(miss)) out[miss] <- tools::toTitleCase(stringr::str_replace_all(outcome[miss], "_", " "))
+  out
+}
+
+# Within-industry DISPLAY ORDER (low-severity/surfacing -> high-severity/harm),
+# so the detectability gradient reads top-to-bottom. Unmapped -> end.
+OUTCOME_RANK <- c(
+  rate_accidents = 1, rate_injuries = 2, rate_fatalities = 3,              # rail
+  rate_lers = 1, rate_scrams = 2, rate_emerg = 3, rate_pct_power_loss = 4, # nrc
+  rate_aids_noharm = 1, rate_aids_propdamage = 2, rate_ntsb_serious_fatal = 3, # aviation
+  rate_t0 = 1, rate_t3 = 2, rate_t2 = 3, rate_t1 = 4, rate_days_lost = 5   # mining
+)
+outcome_rank <- function(outcome) { r <- unname(OUTCOME_RANK[outcome]); r[is.na(r)] <- 99L; r }
+
+# Per-cell DETECTABILITY for the Figure 1A forest swatch. Morantz definition:
+# detectability = (inverse) likelihood that an org could omit a report with no
+# one finding out and no consequences. LOW = easily hidden (discretionary report,
+# low oversight); HIGH = omission would be caught/penalized (objective trace or
+# severe/regulated event). Three approximate levels; keyed by "industry|outcome".
+# Note: nrc LERs AND emergency declarations sit at MODERATE. Both are licensee-
+# classified (the Emergency Director declares the emergency class per 10 CFR
+# 50.72; the NRC only endorses the EAL framework), so they carry classification
+# discretion -- but nuclear's resident-inspector oversight + objective EAL/
+# machine-logged corroboration make omission more likely to be caught than
+# discretionary reports in low-oversight regimes. So: mixed, not Low, not High.
+DETECTABILITY_LEVELS <- c("Low", "Moderate", "High")
+DETECTABILITY <- c(
+  # Low: discretionary report, omission unlikely to be noticed
+  "aviation|rate_aids_noharm"        = "Low",
+  "msha|rate_t0"                     = "Low",
+  "rail|rate_accidents"              = "Low",
+  # Moderate: report-based / licensee-classified -> mixed capture
+  "msha|rate_t3"                     = "Moderate",
+  "msha|rate_t2"                     = "Moderate",
+  "nrc|rate_lers"                    = "Moderate",
+  "nrc|rate_emerg"                   = "Moderate",
+  # High: severe, regulated, or objectively-logged -> omission caught/penalized
+  "rail|rate_injuries"               = "High",
+  "rail|rate_fatalities"             = "High",
+  "aviation|rate_aids_propdamage"    = "High",
+  "aviation|rate_ntsb_serious_fatal" = "High",
+  "msha|rate_t1"                     = "High",
+  "msha|rate_days_lost"              = "High",
+  "nrc|rate_scrams"                  = "High",
+  "nrc|rate_pct_power_loss"          = "High"
+)
+detectability_class <- function(industry, outcome) {
+  v <- unname(DETECTABILITY[paste(industry, outcome, sep = "|")])
+  factor(v, levels = DETECTABILITY_LEVELS)
+}
+# Neutral grey ramp (light -> dark = low -> high detectability): connotation-free
+# and orthogonal to the red/blue sign channel, so it never reads as valence.
+DETECTABILITY_COL <- c("Low" = "#dadada", "Moderate" = "#969696", "High" = "#3f3f3f")
+
+
+# ==============================================================================
 # PLOT STYLING DEFAULTS
 # ==============================================================================
 # Adjust PLOT_BASE_SIZE to scale all text in figures.
@@ -1215,9 +1292,7 @@ build_cross_industry_robustness <- function(figure_dir, industry_labels = NULL) 
   # Clean up for presentation
   all_robustness %>%
     mutate(
-      outcome_label = outcome %>%
-        str_replace_all("_", " ") %>%
-        tools::toTitleCase(),
+      outcome_label = pretty_outcome(outcome),
       component_label = case_when(
         component == "cond"   ~ "Conditional",
         component == "zi"     ~ "Zero-Inflation",
@@ -1280,9 +1355,7 @@ build_cross_industry_importance <- function(figure_dir, industry_labels = NULL) 
 
   all_importance %>%
     mutate(
-      outcome_label = outcome %>%
-        str_replace_all("_", " ") %>%
-        tools::toTitleCase(),
+      outcome_label = pretty_outcome(outcome),
       component_label = case_when(
         component == "cond"   ~ "Cond",
         component == "zi"     ~ "ZI",
@@ -1484,10 +1557,9 @@ plot_cross_industry_climate_vs_ops <- function(industries, industry_labels = NUL
               industry_label = label,
               outcome = out,
               outcome_label = if (comp_label == "") {
-                out %>% str_replace_all("_", " ") %>% tools::toTitleCase()
+                pretty_outcome(out)
               } else {
-                paste0(out %>% str_replace_all("_", " ") %>% tools::toTitleCase(),
-                       " (", comp_label, ")")
+                paste0(pretty_outcome(out), " (", comp_label, ")")
               },
               component = comp_name
             )

@@ -209,6 +209,18 @@ add_facility_ops_features <- function(ops_facility,
 #'   initial_pwr, current_pwr, emerg_class.
 #' @param ops_raw Quarterly unit-level ops frame: facility_unit, quarter_start,
 #'   days_at_power, days_at_full, capacity_factor, power_std.
+#' @param findings_df Optional. Quarterly NRC inspection findings:
+#'   facility_unit, quarter_start, findings_count, findings_green,
+#'   findings_white, findings_yellow, findings_red, findings_nongreen_count.
+#'   Loaded from processed/nrc/findings_quarterly.parquet. When provided, the
+#'   panel gains findings_count, findings_nongreen, and per-color count
+#'   columns (zero-filled against the panel grid).
+#' @param action_matrix_df Optional. Quarterly NRC Reactor Oversight Process
+#'   action matrix column assignments: facility_unit, quarter_start,
+#'   action_matrix_col (1..5; higher = worse). Loaded from
+#'   processed/nrc/action_matrix_long.parquet. When provided, the panel gains
+#'   action_matrix_col_raw and above_col1 (binary: 1 if column >= 2).
+#'   NA where no assessment was recorded that quarter.
 #' @param min_reports Minimum at-power events per facility to retain.
 #' @param max_holdover_days Climate-score recency cap (default 365).
 #' @param climate_base Per-event climate score column.
@@ -216,6 +228,8 @@ add_facility_ops_features <- function(ops_facility,
 #' @return Tibble ready for panel-rate modeling.
 prepare_nrc_panel_data <- function(parquet_path, config_id, events_df,
                                     ops_raw,
+                                    findings_df      = NULL,
+                                    action_matrix_df = NULL,
                                     min_reports = MIN_REPORTS_DEFAULT,
                                     max_holdover_days = 365L,
                                     climate_base = "overall_final_score",
@@ -315,6 +329,77 @@ prepare_nrc_panel_data <- function(parquet_path, config_id, events_df,
       mean_pct_power_loss = coalesce(mean_pct_power_loss, 0)
     )
 
+  # --- 5b. External NRC assessment outcomes (findings + action matrix) ---
+  # These come from separate quarterly files (not events.parquet) and serve as
+  # externally-judged "performance" outcomes complementary to the self-reported
+  # LER-derived measures. Joined on facility_site × quarter_start and
+  # zero-filled (findings) / dropped-where-missing (action matrix) against the
+  # panel grid.
+  #
+  # Derived columns:
+  #   findings_count        — count of NRC inspection findings, all colors
+  #   findings_nongreen     — count of safety-significant (white+yellow+red)
+  #                            findings; green findings are predominantly
+  #                            procedural and dominate raw counts ~95%
+  #   above_col1            — 1 if action_matrix_col >= 2 in the quarter (i.e.
+  #                            facility is above NRC baseline regulatory
+  #                            response), else 0; NA if no assessment that
+  #                            quarter
+  #   action_matrix_col_raw — original 1..5 column (NA elsewhere) for sensitivity
+  if (!is.null(findings_df)) {
+    f_keep <- findings_df %>%
+      mutate(
+        facility_site = normalize_nrc_facility(facility_unit),
+        quarter_start = as.Date(quarter_start)
+      ) %>%
+      filter(facility_site %in% keep_facs) %>%
+      group_by(facility_site, quarter_start) %>%
+      summarise(
+        findings_count    = sum(findings_count,    na.rm = TRUE),
+        findings_green    = sum(findings_green,    na.rm = TRUE),
+        findings_white    = sum(findings_white,    na.rm = TRUE),
+        findings_yellow   = sum(findings_yellow,   na.rm = TRUE),
+        findings_red      = sum(findings_red,      na.rm = TRUE),
+        findings_nongreen = sum(findings_nongreen_count, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    panel <- panel %>%
+      left_join(f_keep, by = c("facility_site", "quarter_start")) %>%
+      mutate(
+        findings_count    = coalesce(findings_count,    0L),
+        findings_green    = coalesce(findings_green,    0L),
+        findings_white    = coalesce(findings_white,    0L),
+        findings_yellow   = coalesce(findings_yellow,   0L),
+        findings_red      = coalesce(findings_red,      0L),
+        findings_nongreen = coalesce(findings_nongreen, 0L)
+      )
+  }
+
+  if (!is.null(action_matrix_df)) {
+    am_keep <- action_matrix_df %>%
+      mutate(
+        facility_site = normalize_nrc_facility(facility_unit),
+        quarter_start = as.Date(quarter_start)
+      ) %>%
+      filter(facility_site %in% keep_facs,
+              action_matrix_col %in% 1:5) %>%
+      # Multiple units at a facility can have different column assignments —
+      # take the WORST (highest column number) to reflect the site-level
+      # regulatory response posture.
+      group_by(facility_site, quarter_start) %>%
+      summarise(action_matrix_col_raw = max(action_matrix_col, na.rm = TRUE),
+                 .groups = "drop") %>%
+      mutate(above_col1 = as.integer(action_matrix_col_raw >= 2))
+
+    panel <- panel %>%
+      left_join(am_keep, by = c("facility_site", "quarter_start"))
+    # Note: above_col1 and action_matrix_col_raw are NA where no assessment
+    # was recorded for that facility-quarter. Downstream filtering drops
+    # those rows in the binomial fit (cannot zero-fill — absence of
+    # assessment is structurally different from "assessed at column 1").
+  }
+
   # --- 6. Operational exposure + between/within ---
   panel <- panel %>%
     left_join(ops_facility, by = c("facility_site", "quarter_start"))
@@ -345,6 +430,24 @@ prepare_nrc_panel_data <- function(parquet_path, config_id, events_df,
     sum(panel$n_lers > 0),
     100 * mean(panel$n_lers > 0)
   ))
+  if ("findings_count" %in% names(panel)) {
+    message(sprintf(
+      "    findings_count: %d non-zero (%.1f%%); findings_nongreen: %d non-zero (%.1f%%)",
+      sum(panel$findings_count > 0),
+      100 * mean(panel$findings_count > 0),
+      sum(panel$findings_nongreen > 0),
+      100 * mean(panel$findings_nongreen > 0)
+    ))
+  }
+  if ("above_col1" %in% names(panel)) {
+    n_assessed <- sum(!is.na(panel$above_col1))
+    message(sprintf(
+      "    action_matrix: %d quarters assessed (%.1f%%); above_col1: %d (%.1f%% of assessed)",
+      n_assessed, 100 * n_assessed / nrow(panel),
+      sum(panel$above_col1, na.rm = TRUE),
+      100 * mean(panel$above_col1, na.rm = TRUE)
+    ))
+  }
 
   panel
 }

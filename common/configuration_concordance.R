@@ -238,25 +238,32 @@ compute_delta_brier <- function(cv_results,
              (model_label == "full") |
              (model_label == "climate"))
 
-  # Extract full model metric values
+  # Extract full model metric values.
+  # IMPORTANT: include `outcome` (and `panel_outcome` when present) in the
+  # join keys. Previously omitted, which caused a 1-to-N join blow-up
+  # whenever multiple outcomes shared a (config, climate_var, strategy) —
+  # producing inflated row counts and double-counted climate_helps flags in
+  # downstream filtering.
+  has_panel_outcome <- "panel_outcome" %in% names(cv)
+  join_keys <- c("config_id", "climate_var_tested", "cv_strategy", "outcome")
+  if (has_panel_outcome) join_keys <- c(join_keys, "panel_outcome")
+
   full_models <- cv %>%
     filter(is_full_model, !is.na(.data[[metric_col_in_cv]])) %>%
-    select(config_id, climate_var_tested, cv_strategy,
-           brier_full = all_of(metric_col_in_cv))
+    select(all_of(join_keys), brier_full = all_of(metric_col_in_cv))
 
   # Extract baseline metric values
   baseline_labels <- c("intercept_only", "no_climate", "seasonal_only",
                        "seasonal_ops", "seasonal")
   baselines <- cv %>%
     filter(model_label %in% baseline_labels, !is.na(.data[[metric_col_in_cv]])) %>%
-    select(config_id, climate_var_tested, cv_strategy,
-           model_label, brier_baseline = all_of(metric_col_in_cv))
+    select(all_of(join_keys), model_label,
+           brier_baseline = all_of(metric_col_in_cv))
 
   if (baseline_strategy == "all") {
     # Return delta against every available baseline
     delta <- full_models %>%
-      inner_join(baselines,
-                 by = c("config_id", "climate_var_tested", "cv_strategy")) %>%
+      inner_join(baselines, by = join_keys) %>%
       mutate(
         delta_brier = brier_full - brier_baseline,
         climate_helps = metric$helps_op(delta_brier),
@@ -266,15 +273,15 @@ compute_delta_brier <- function(cv_results,
   }
 
   if (baseline_strategy == "best_non_climate") {
-    # For each config, pick the strongest baseline (lowest Brier or highest loglik)
+    # For each config × outcome × strategy, pick the strongest baseline.
     best_baselines <- if (metric$direction == "lower") {
       baselines %>%
-        group_by(config_id, climate_var_tested, cv_strategy) %>%
+        group_by(across(all_of(join_keys))) %>%
         slice_min(brier_baseline, n = 1, with_ties = FALSE) %>%
         ungroup()
     } else {
       baselines %>%
-        group_by(config_id, climate_var_tested, cv_strategy) %>%
+        group_by(across(all_of(join_keys))) %>%
         slice_max(brier_baseline, n = 1, with_ties = FALSE) %>%
         ungroup()
     }
@@ -290,8 +297,7 @@ compute_delta_brier <- function(cv_results,
   }
 
   delta <- full_models %>%
-    inner_join(best_baselines,
-               by = c("config_id", "climate_var_tested", "cv_strategy")) %>%
+    inner_join(best_baselines, by = join_keys) %>%
     mutate(
       delta_brier = brier_full - brier_baseline,
       climate_helps = metric$helps_op(delta_brier),

@@ -53,9 +53,12 @@ suppressPackageStartupMessages({
 #' @param apt_dist_nm    Maximum distance from nearest airport in nautical miles
 #' @return Tibble: airport_id, yearmonth (Date), n_accidents, sum_serious_fatal,
 #'   sum_fatalities. One row per airport-month with at least one accident.
-load_ntsb_panel_rate <- function(ntsb_post_path, ntsb_pre_path, apt_dist_nm = 5L) {
+load_ntsb_panel_rate <- function(ntsb_post_path, ntsb_pre_path, apt_dist_nm = 5L,
+                                  period = "month") {
 
-  message(sprintf("  Loading NTSB data (apt_dist <= %d NM)...", apt_dist_nm))
+  message(sprintf("  Loading NTSB data (apt_dist <= %d NM, period=%s)...",
+                  apt_dist_nm, period))
+  .pu <- if (period == "quarter") "quarter" else "month"
 
   shared_cols <- c(
     "ev_type", "ev_date", "ev_year", "ev_month",
@@ -90,10 +93,14 @@ load_ntsb_panel_rate <- function(ntsb_post_path, ntsb_pre_path, apt_dist_nm = 5L
     ) %>%
     mutate(
       airport_id = str_to_upper(str_trim(ev_nr_apt_id)),
-      yearmonth  = as.Date(paste0(ev_year, "-",
-                                  str_pad(ev_month, 2, pad = "0"), "-01"))
+      yearmonth  = lubridate::floor_date(
+        as.Date(paste0(ev_year, "-", str_pad(ev_month, 2, pad = "0"), "-01")),
+        unit = .pu)
     ) %>%
     filter(!is.na(yearmonth))
+
+  acc <- acc %>%
+    mutate(.hi = str_to_upper(str_trim(as.character(ev_highest_injury))))
 
   acc %>%
     group_by(airport_id, yearmonth) %>%
@@ -102,6 +109,13 @@ load_ntsb_panel_rate <- function(ntsb_post_path, ntsb_pre_path, apt_dist_nm = 5L
       sum_serious_fatal = sum(coalesce(inj_tot_f, 0L) + coalesce(inj_tot_s, 0L),
                                na.rm = TRUE),
       sum_fatalities    = sum(coalesce(inj_tot_f, 0L), na.rm = TRUE),
+      # NTSB injury-severity EVENT-count tiers (highest-injury per accident:
+      # FATL/SERS/MINR/NONE). Injury severity lives only in NTSB (AIDS has no
+      # serious/minor split). These grade the casualty axis; AIDS grades damage.
+      n_ntsb_minor         = sum(.hi == "MINR", na.rm = TRUE),
+      n_ntsb_serious       = sum(.hi == "SERS", na.rm = TRUE),
+      n_ntsb_fatal         = sum(.hi == "FATL", na.rm = TRUE),
+      n_ntsb_serious_fatal = sum(.hi %in% c("SERS", "FATL"), na.rm = TRUE),
       .groups = "drop"
     )
 }
@@ -146,7 +160,9 @@ prepare_aviation_panel_data <- function(parquet_path, config_id,
                                          min_reports = MIN_REPORTS_DEFAULT,
                                          max_holdover_days = 365L,
                                          climate_base = "overall_final_score",
-                                         window_specs = NULL) {
+                                         window_specs = NULL,
+                                         period = "month") {
+  .grain <- if (period == "quarter") "quarter" else "month"
 
   if (!file.exists(parquet_path)) {
     stop(sprintf("Parquet file not found: %s", parquet_path))
@@ -214,6 +230,24 @@ prepare_aviation_panel_data <- function(parquet_path, config_id,
     ) %>%
     filter(airport_id %in% keep_apts)
 
+  # Quarterly grain: sum the offset (departures = total exposure in the quarter),
+  # average the already-standardized between/within ops covariates over the 3
+  # months. Keeps the column named `yearmonth` (now quarter-start) so downstream
+  # windowing/fit/CV is unchanged.
+  if (.grain == "quarter") {
+    ops_keep <- ops_keep %>%
+      mutate(yearmonth = lubridate::floor_date(yearmonth, "quarter")) %>%
+      group_by(airport_id, yearmonth) %>%
+      summarise(
+        departures         = sum(departures, na.rm = TRUE),
+        seats_between      = mean(seats_between, na.rm = TRUE),
+        seats_within       = mean(seats_within, na.rm = TRUE),
+        passengers_between = mean(passengers_between, na.rm = TRUE),
+        passengers_within  = mean(passengers_within, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
   if (nrow(ops_keep) == 0) {
     stop(sprintf("Config %s: no ops rows for kept airports (atc_scope=%s)",
                  config_id, atc_scope))
@@ -226,7 +260,7 @@ prepare_aviation_panel_data <- function(parquet_path, config_id,
   grid <- make_panel_grid(climate_events,
                           org_var  = "airport_id",
                           date_var = "event_date",
-                          period   = "month",
+                          period   = .grain,
                           min_date = ops_min_date,
                           max_date = ops_max_date) %>%
     rename(yearmonth = period_start)
@@ -262,7 +296,11 @@ prepare_aviation_panel_data <- function(parquet_path, config_id,
     mutate(
       n_accidents       = coalesce(n_accidents,       0L),
       sum_serious_fatal = coalesce(sum_serious_fatal, 0L),
-      sum_fatalities    = coalesce(sum_fatalities,    0L)
+      sum_fatalities    = coalesce(sum_fatalities,    0L),
+      n_ntsb_minor         = coalesce(n_ntsb_minor,         0L),
+      n_ntsb_serious       = coalesce(n_ntsb_serious,       0L),
+      n_ntsb_fatal         = coalesce(n_ntsb_fatal,         0L),
+      n_ntsb_serious_fatal = coalesce(n_ntsb_serious_fatal, 0L)
     )
 
   # --- 5b. AIDS outcome aggregation (zero-fill where no AIDS events) ---
@@ -282,14 +320,26 @@ prepare_aviation_panel_data <- function(parquet_path, config_id,
       mutate(
         n_aids_all       = coalesce(n_aids_all,       0L),
         n_aids_accidents = coalesce(n_aids_accidents, 0L),
-        n_aids_incidents = coalesce(n_aids_incidents, 0L)
+        n_aids_incidents = coalesce(n_aids_incidents, 0L),
+        n_aids_noharm    = coalesce(n_aids_noharm,    0L),
+        n_aids_propdamage= coalesce(n_aids_propdamage,0L),
+        n_aids_zeroharm  = coalesce(n_aids_zeroharm,  0L),
+        n_aids_injury    = coalesce(n_aids_injury,    0L),
+        n_aids_fatal     = coalesce(n_aids_fatal,     0L),
+        n_aids_harm      = coalesce(n_aids_harm,      0L)
       )
   } else {
     panel <- panel %>%
       mutate(
         n_aids_all       = NA_integer_,
         n_aids_accidents = NA_integer_,
-        n_aids_incidents = NA_integer_
+        n_aids_incidents = NA_integer_,
+        n_aids_noharm    = NA_integer_,
+        n_aids_propdamage= NA_integer_,
+        n_aids_zeroharm  = NA_integer_,
+        n_aids_injury    = NA_integer_,
+        n_aids_fatal     = NA_integer_,
+        n_aids_harm      = NA_integer_
       )
   }
 
