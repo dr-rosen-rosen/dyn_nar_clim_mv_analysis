@@ -40,7 +40,7 @@ source("common/panel_multiverse_runner.R")
 # PATHS
 # =============================================================================
 
-CFG_DIR         <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/msha_06-01-2026"
+CFG_DIR         <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/notebooks/checkpoints/msha_2026-07-13"
 DATA_DIR        <- "/Users/michaelrosen/Documents/dev/DynamicNarrativeClimateToolkit/dynclim/data/processed/msha"
 EVENTS_PATH     <- file.path(DATA_DIR, "events.parquet")
 OPS_PATH        <- file.path(DATA_DIR, "ops_mine_quarter.parquet")
