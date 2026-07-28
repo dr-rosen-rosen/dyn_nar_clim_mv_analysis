@@ -582,6 +582,67 @@ cat(sprintf("  Saved figure1a_forest_persd_{log,rateratio}.pdf (main), extended_
 
 
 # =============================================================================
+# 6b. APPENDIX — GROUP-KFOLD PER-SD FOREST (CV-strategy robustness)
+# =============================================================================
+# Same per-SD standardization + detectability swatch as Figure 1A and the
+# same main-text outcome set, but with champions selected under org-blocked
+# group-kfold CV. Replaces the raw-coefficient appendix_forest_group_kfold_*
+# variants as the manuscript's appendix forest (raw versions still written
+# above for the archive).
+
+cat("\n=== Building appendix group-kfold per-SD forest ===\n")
+gk_champs <- champion_table %>% filter(cv_strategy == "group_kfold")
+pd_results_gk <- list()
+for (i in seq_len(nrow(gk_champs))) {
+  row  <- gk_champs[i, ]
+  ind  <- row$industry
+  outc <- row$outcome
+  cat(sprintf("  [%d/%d] %s — %s ... ", i, nrow(gk_champs), ind, outc))
+  sm <- spec_map[[ind]]
+  if (is.null(sm$offset[[outc]])) {
+    cat("(no spec_map entry; skipping)\n"); next
+  }
+  res <- tryCatch(
+    refit_champion_and_predict(
+      industry_key      = ind,
+      outcome           = outc,
+      cv_strategy       = "group_kfold",
+      champion_table    = champion_table,
+      panel_data_fn     = panel_fns[[ind]],
+      cfg_dir           = industries[[ind]]$cfg_dir,
+      fit_fn            = sm$fit_fn,
+      outcome_offset    = sm$offset[[outc]],
+      outcome_bw_terms  = sm$bw[[outc]],
+      outcome_org_var   = sm$org,
+      outcome_var       = sm$var[[outc]],
+      outcome_family    = sm$family[[outc]]
+    ),
+    error = function(e) { cat("ERR:", conditionMessage(e), "\n"); NULL }
+  )
+  if (!is.null(res)) {
+    pd_results_gk[[paste(ind, outc, sep = "|")]] <- res
+    cat("ok\n")
+  }
+}
+
+coefs_long_gk <- extract_champion_standardized_coefs(pd_results_gk, champion_table) %>%
+  mutate(rr = exp(estimate_std), rr_ci_low = exp(ci_low_std), rr_ci_high = exp(ci_high_std)) %>%
+  relocate(rr, rr_ci_low, rr_ci_high, .after = ci_high_std)
+readr::write_csv(coefs_long_gk,
+                 "report_figures_manuscript/appendix_forest_group_kfold_persd_coefs.csv")
+
+ggsave("report_figures_manuscript/appendix_forest_group_kfold_persd_rateratio.pdf",
+       plot_bestmodel_forest_per_sd(coefs_long_gk, scale = "rate_ratio",
+                                    exclude_cells = EXCLUDE_FROM_MAIN),
+       width = 9, height = 5)
+ggsave("report_figures_manuscript/appendix_forest_group_kfold_persd_log.pdf",
+       plot_bestmodel_forest_per_sd(coefs_long_gk, scale = "log",
+                                    exclude_cells = EXCLUDE_FROM_MAIN),
+       width = 9, height = 5)
+cat("  Saved appendix_forest_group_kfold_persd_{log,rateratio}.pdf\n")
+
+
+# =============================================================================
 # 7. FIGURE 2 — PARTIAL-DEPENDENCE GRID
 # =============================================================================
 
