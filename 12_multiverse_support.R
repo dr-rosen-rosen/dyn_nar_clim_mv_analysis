@@ -97,7 +97,22 @@ breadth <- delta %>%
             best_dll      = round(max(loglik_mean), 3),
             pct_same_sign = round(100 * mean(mv_sign[loglik_mean > 0] ==
                                              best_sign[loglik_mean > 0], na.rm = TRUE), 0),
-            .groups = "drop")
+            # Modal sign of the credible (dll>0) pool + its consensus share.
+            # Best-vs-modal disagreement is the argmax-fragility flag: the
+            # best-dll cell is won by ~nothing everywhere (margins <=6e-4 in
+            # the 2026-07 rerun), so where consensus is weak the best-spec
+            # sign is effectively a coin flip (see scrams pct_same_sign
+            # inverting 77->22 while the pool stayed 78% negative).
+            modal_dll_sign = { s <- mv_sign[loglik_mean > 0]; s <- s[!is.na(s)]
+                               if (!length(s)) NA_real_ else
+                               as.numeric(names(sort(table(s), decreasing = TRUE))[1]) },
+            pct_modal     = { s <- mv_sign[loglik_mean > 0]; s <- s[!is.na(s)]
+                              if (!length(s)) NA_real_ else
+                              round(100 * max(table(s)) / length(s), 0) },
+            best_sign_val = dplyr::first(best_sign),
+            .groups = "drop") %>%
+  mutate(best_ne_modal = !is.na(modal_dll_sign) & !is.na(best_sign_val) &
+                         best_sign_val != modal_dll_sign)
 
 # =============================================================================
 # 2. CV SIGN STABILITY — credible-mass (modal sign) + best-spec (sign match)
@@ -179,6 +194,8 @@ full_tbl <- tab %>%
             `Best RR (per-SD)` = round(best_rr, 2), `95% CI` = best_rr_ci,
             `Best dll` = best_dll, `Median dll` = median_dll,
             `% dll>0` = pct_dll_pos, `% same-sign (dll>0)` = pct_same_sign,
+            `Modal consensus %` = pct_modal,
+            `Best vs modal disagree` = best_ne_modal,
             `Modal sign (TS)` = sgn(modal_timeseries),
             `Modal sign (GK)` = sgn(modal_group_kfold),
             `frac+ (TS)` = round(frac_pos_timeseries, 2),
@@ -196,6 +213,8 @@ main_tbl <- tab %>%
             `Outcome class` = outcome_class,
             `Best RR (per-SD)` = round(best_rr, 2),
             `% dll>0` = pct_dll_pos, `% same-sign (dll>0)` = pct_same_sign,
+            `Modal consensus %` = pct_modal,
+            `Best vs modal disagree` = best_ne_modal,
             `Modal sign TS/GK` = paste0(sgn(modal_timeseries), "/", sgn(modal_group_kfold)),
             `Credible-mass flip` = credmass_flip,
             `Best-spec sign match` = bestspec_match)
