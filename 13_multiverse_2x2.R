@@ -215,18 +215,13 @@ readr::write_csv(
 glyph_shape <- c("CV-stable" = 16, "Credible-mass flip only" = 1,
                  "Argmax-driven flip (best-spec only)" = 13, "Both estimators flip" = 8)
 
-quad_lab <- tibble(
-  x = c(98, 98, 2, 2), y = c(98, 2, 98, 2),
-  hjust = c(1, 1, 0, 0), vjust = c(1, 0, 1, 0),
-  label = c("Robust & coherent","Pervasive but\nsign-incoherent",
-            "Coherent but narrow","Weak / ambiguous"))
+# Quadrant corner labels dropped (owner decision 2026-07): with coherence
+# bounded to [50,100] the lower half of the plane is unreachable, and the
+# anchors are descriptive rather than categorical — the continuum plus the
+# glyphs/asterisks carry the information without implying tiers.
 
 p <- ggplot(tab, aes(consistency, coherence)) +
   geom_vline(xintercept = CONSIST_CUT, linetype = "dashed", colour = "gray70") +
-  geom_hline(yintercept = COHER_CUT,   linetype = "dashed", colour = "gray70") +
-  geom_text(data = quad_lab, aes(x, y, label = label, hjust = hjust, vjust = vjust),
-            inherit.aes = FALSE, colour = "gray60", size = 3, fontface = "italic",
-            lineheight = 0.9) +
   geom_point(aes(colour = industry_label, shape = flip_glyph),
              size = 3.2, stroke = 1.1)
 
@@ -245,14 +240,14 @@ p <- p +
                      drop = FALSE) +
   scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
                      labels = function(x) paste0(x, "%")) +
-  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
+  scale_y_continuous(limits = c(50, 100), breaks = seq(50, 100, 10),
                      labels = function(x) paste0(x, "%")) +
   labs(x = "Consistency  ->  % specifications with held-out gain (dLL > 0)",
        y = "Coherence  ->  % modal-sign consensus (among dLL > 0)",
        title = "Multiverse support for narrative-derived safety climate",
        subtitle = paste0(
-         "Consistency x coherence; dashed 50% lines are descriptive anchors, not tiers. ",
-         "Coherence is bounded below at 50% by construction.",
+         "Dashed line marks the 50% consistency midpoint (descriptive anchor, not a tier); ",
+         "the coherence axis begins at its 50% lower bound.",
          "\nGlyph = CV-strategy sign stability (time-series vs organization-blocked). ",
          "* = best-performing specification's sign contradicts the modal sign.")) +
   guides(colour = guide_legend(order = 1, override.aes = list(shape = 16, size = 3)),
