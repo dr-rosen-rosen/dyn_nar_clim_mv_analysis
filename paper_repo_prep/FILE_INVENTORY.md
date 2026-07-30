@@ -4,7 +4,7 @@ This is the definitive "keep / drop" list for the frozen paper repository,
 derived by transitively tracing `source()` calls and function references
 from the paper's entry points:
 
-- `4_plots_panel.R` (champion selection + Quarto reports)
+- `4_gen_champions.R` (champion selection)
 - `5_manuscript_plots.R` (Figures 1, 2, 3, 4)
 - `6_sensitivity_plots.R` (Appendix sensitivity figures)
 - `7_table1_data_sources.R` (Table 1)
@@ -21,7 +21,7 @@ one of the above. Files marked DROP are not referenced by any paper path.
 | File | Status | Reason |
 |---|---|---|
 | `3_plots.R` | **DROP** | Event-level report generator from the old (pre-panel-rate) pipeline. Not used by any paper figure. |
-| `4_plots_panel.R` | KEEP | Generates champion CSVs via `generate_mv_report()`. Required prior to 5/6. |
+| `4_gen_champions.R` | KEEP | Generates champion CSVs via `generate_mv_report()`. Required prior to 5/6. |
 | `5_manuscript_plots.R` | KEEP | Builds main-text figures 1A, 1B, 2, 3, 4 and appendix variants. |
 | `6_sensitivity_plots.R` | KEEP | Appendix sensitivity analyses. |
 | `7_table1_data_sources.R` | KEEP | Generates Table 1 and post-filter panel summary. |
