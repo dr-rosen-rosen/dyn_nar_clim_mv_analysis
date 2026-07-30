@@ -35,15 +35,17 @@ IND_LABEL <- c(rail="Rail", nrc="Nuclear", aviation="Aviation", msha="Mining")
 IND_COL <- c(Rail="#2c7bb6", Nuclear="#1a9850", Aviation="#d6604d", Mining="#8856a7")
 RFM <- "report_figures_manuscript"
 
-# Standard 2x2 split (no data-tuned cutoffs). Consistency splits at the 50%
-# midpoint of [0,100]. Coherence is the MODAL-SIGN consensus share of the
-# credible set (2026-07 redefinition: the best-performing spec is selected by
-# knife-edge margins, <=6e-4 dLL, and can contradict a stable consensus — see
-# scrams), which is bounded to [50,100] by construction because the mode always
-# holds the plurality; its principled midpoint is therefore 75. Sensitivity at
-# the 2:1-odds cut (66.7%) is logged below; cells at 68-74% sit near the line.
+# Descriptive 50/50 anchors on both axes (owner decision 2026-07: these are
+# lay-of-the-land reference lines, NOT category boundaries — we deliberately
+# avoid drawing strong tiers where none exist). Coherence is the MODAL-SIGN
+# consensus share of the credible set (redefined 2026-07: the best-performing
+# spec is selected by knife-edge margins, <=6e-4 dLL, and can contradict a
+# stable consensus — see scrams), bounded to [50,100] by construction because
+# the mode always holds the plurality; the region below the 50% line is
+# therefore unreachable, which the full axis shows honestly. Sensitivity of
+# any coherence classification to 66.7/75 cuts is logged below for reference.
 CONSIST_CUT <- 50
-COHER_CUT   <- 75
+COHER_CUT   <- 50
 # Margin from 0.5 below which a credible-mass modal sign is treated as too
 # balanced to call confidently (drives the "tentative" footnote, not the glyph).
 BALANCE_MARGIN <- 0.10
@@ -214,7 +216,7 @@ glyph_shape <- c("CV-stable" = 16, "Credible-mass flip only" = 1,
                  "Argmax-driven flip (best-spec only)" = 13, "Both estimators flip" = 8)
 
 quad_lab <- tibble(
-  x = c(98, 98, 2, 2), y = c(99.5, 50.5, 99.5, 50.5),
+  x = c(98, 98, 2, 2), y = c(98, 2, 98, 2),
   hjust = c(1, 1, 0, 0), vjust = c(1, 0, 1, 0),
   label = c("Robust & coherent","Pervasive but\nsign-incoherent",
             "Coherent but narrow","Weak / ambiguous"))
@@ -243,14 +245,14 @@ p <- p +
                      drop = FALSE) +
   scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
                      labels = function(x) paste0(x, "%")) +
-  scale_y_continuous(limits = c(50, 100), breaks = seq(50, 100, 25),
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
                      labels = function(x) paste0(x, "%")) +
   labs(x = "Consistency  ->  % specifications with held-out gain (dLL > 0)",
        y = "Coherence  ->  % modal-sign consensus (among dLL > 0)",
        title = "Multiverse support for narrative-derived safety climate",
        subtitle = paste0(
-         "Consistency x coherence. Consistency splits at its 50% midpoint; coherence ",
-         "(bounded 50-100% by construction) at its 75% midpoint.",
+         "Consistency x coherence; dashed 50% lines are descriptive anchors, not tiers. ",
+         "Coherence is bounded below at 50% by construction.",
          "\nGlyph = CV-strategy sign stability (time-series vs organization-blocked). ",
          "* = best-performing specification's sign contradicts the modal sign.")) +
   guides(colour = guide_legend(order = 1, override.aes = list(shape = 16, size = 3)),
