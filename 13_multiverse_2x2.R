@@ -35,12 +35,15 @@ IND_LABEL <- c(rail="Rail", nrc="Nuclear", aviation="Aviation", msha="Mining")
 IND_COL <- c(Rail="#2c7bb6", Nuclear="#1a9850", Aviation="#d6604d", Mining="#8856a7")
 RFM <- "report_figures_manuscript"
 
-# Standard 2x2 split at the 50% midpoint of each axis (no data-tuned cutoffs).
-# Coherence shows no natural gap in this data (sorted: 26 37 59 66 70 70 73 76
-# 77 82 85 92 100 100 100), so rather than fit a threshold we use the principled
-# midpoint and show the continuum of points underneath. Sensitivity logged below.
+# Standard 2x2 split (no data-tuned cutoffs). Consistency splits at the 50%
+# midpoint of [0,100]. Coherence is the MODAL-SIGN consensus share of the
+# credible set (2026-07 redefinition: the best-performing spec is selected by
+# knife-edge margins, <=6e-4 dLL, and can contradict a stable consensus — see
+# scrams), which is bounded to [50,100] by construction because the mode always
+# holds the plurality; its principled midpoint is therefore 75. Sensitivity at
+# the 2:1-odds cut (66.7%) is logged below; cells at 68-74% sit near the line.
 CONSIST_CUT <- 50
-COHER_CUT   <- 50
+COHER_CUT   <- 75
 # Margin from 0.5 below which a credible-mass modal sign is treated as too
 # balanced to call confidently (drives the "tentative" footnote, not the glyph).
 BALANCE_MARGIN <- 0.10
@@ -102,9 +105,18 @@ axes <- delta %>% filter(cv_strategy == "timeseries") %>%
   group_by(industry, outcome = panel_outcome) %>%
   summarise(n_spec        = n(),
             consistency   = round(100 * mean(loglik_mean > 0), 0),
-            coherence     = round(100 * mean(mv_sign[loglik_mean > 0] ==
-                                             best_sign[loglik_mean > 0], na.rm = TRUE), 0),
-            .groups = "drop")
+            # Coherence = consensus share of the credible set's modal sign
+            # (bounded [50,100]); the best spec no longer anchors the axis.
+            coherence     = { s <- mv_sign[loglik_mean > 0]; s <- s[!is.na(s)]
+                              if (!length(s)) NA_real_ else
+                              round(100 * max(table(s)) / length(s), 0) },
+            modal_sign_ts = { s <- mv_sign[loglik_mean > 0]; s <- s[!is.na(s)]
+                              if (!length(s)) NA_real_ else
+                              as.numeric(names(sort(table(s), decreasing = TRUE))[1]) },
+            best_sign_val = dplyr::first(best_sign),
+            .groups = "drop") %>%
+  mutate(best_ne_modal = !is.na(best_sign_val) & !is.na(modal_sign_ts) &
+                         best_sign_val != modal_sign_ts)
 
 # =============================================================================
 # 2. FLIP ESTIMATOR (b): credible-mass modal sign per CV strategy
@@ -174,12 +186,16 @@ tab <- OUTCOME_META %>%
          flip_glyph = factor(flip_glyph, levels = c(
            "CV-stable","Credible-mass flip only",
            "Argmax-driven flip (best-spec only)","Both estimators flip")),
-         cell = sprintf("%s: %s", industry_label, outcome_label))
+         cell = sprintf("%s: %s", industry_label, outcome_label),
+         # asterisk = best-performing spec's sign contradicts the modal sign
+         plot_label = ifelse(best_ne_modal, paste0(outcome_label, "*"),
+                             outcome_label))
 
 readr::write_csv(
   tab %>% transmute(Industry = industry_label, Outcome = outcome_label,
     `Outcome class` = outcome_class, Quadrant = quadrant,
-    Consistency = consistency, Coherence = coherence, `N spec` = n_spec,
+    Consistency = consistency, Coherence = coherence,
+    `Best vs modal disagree` = best_ne_modal, `N spec` = n_spec,
     `Flip (best-spec a)` = flip_a, `Flip (best-spec, sig)` = flip_a_sig,
     `Flip (credible-mass b)` = flip_b, `Flip (b, confident)` = flip_b_confident,
     `frac_pos ts` = round(frac_pos_timeseries, 2),
@@ -198,7 +214,7 @@ glyph_shape <- c("CV-stable" = 16, "Credible-mass flip only" = 1,
                  "Argmax-driven flip (best-spec only)" = 13, "Both estimators flip" = 8)
 
 quad_lab <- tibble(
-  x = c(98, 98, 2, 2), y = c(98, 2, 98, 2),
+  x = c(98, 98, 2, 2), y = c(99.5, 50.5, 99.5, 50.5),
   hjust = c(1, 1, 0, 0), vjust = c(1, 0, 1, 0),
   label = c("Robust & coherent","Pervasive but\nsign-incoherent",
             "Coherent but narrow","Weak / ambiguous"))
@@ -213,11 +229,11 @@ p <- ggplot(tab, aes(consistency, coherence)) +
              size = 3.2, stroke = 1.1)
 
 if (requireNamespace("ggrepel", quietly = TRUE)) {
-  p <- p + ggrepel::geom_text_repel(aes(label = outcome_label, colour = industry_label),
+  p <- p + ggrepel::geom_text_repel(aes(label = plot_label, colour = industry_label),
              size = 2.7, max.overlaps = 20, seed = 1, show.legend = FALSE,
              min.segment.length = 0, segment.colour = "gray75")
 } else {
-  p <- p + geom_text(aes(label = outcome_label, colour = industry_label),
+  p <- p + geom_text(aes(label = plot_label, colour = industry_label),
              size = 2.6, vjust = -0.9, show.legend = FALSE)
 }
 
@@ -227,15 +243,16 @@ p <- p +
                      drop = FALSE) +
   scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
                      labels = function(x) paste0(x, "%")) +
-  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
+  scale_y_continuous(limits = c(50, 100), breaks = seq(50, 100, 25),
                      labels = function(x) paste0(x, "%")) +
   labs(x = "Consistency  ->  % specifications with held-out gain (dLL > 0)",
-       y = "Coherence  ->  % same sign as best model (among dLL > 0)",
+       y = "Coherence  ->  % modal-sign consensus (among dLL > 0)",
        title = "Multiverse support for narrative-derived safety climate",
        subtitle = paste0(
-         "Consistency x coherence, split at the 50% midpoint of each axis. ",
-         "Glyph = CV-strategy sign stability (time-series vs organization-blocked).",
-         "\nBoth flip estimators reported; argmax-driven flips are marked, not demoted.")) +
+         "Consistency x coherence. Consistency splits at its 50% midpoint; coherence ",
+         "(bounded 50-100% by construction) at its 75% midpoint.",
+         "\nGlyph = CV-strategy sign stability (time-series vs organization-blocked). ",
+         "* = best-performing specification's sign contradicts the modal sign.")) +
   guides(colour = guide_legend(order = 1, override.aes = list(shape = 16, size = 3)),
          shape  = guide_legend(order = 2, override.aes = list(colour = "gray20"))) +
   theme_minimal(base_size = 10) +
@@ -257,13 +274,22 @@ print(as.data.frame(tab %>% arrange(desc(consistency)) %>%
             fpos_gk = round(frac_pos_group_kfold, 2),
             thin = thin_credible)), row.names = FALSE)
 
-cat("\n--- Cells near the 50% midpoint (quadrant-fragile under standard split) ---\n")
-near_coh <- tab %>% filter(abs(coherence - 50)   <= 10) %>% transmute(cell, coherence)   %>% arrange(coherence)
-near_con <- tab %>% filter(abs(consistency - 50) <= 10) %>% transmute(cell, consistency) %>% arrange(consistency)
-cat("coherence within 50+/-10:   ",
+cat("\n--- Cells near the axis cuts (quadrant-fragile under standard split) ---\n")
+near_coh <- tab %>% filter(abs(coherence - COHER_CUT)     <= 10) %>% transmute(cell, coherence)   %>% arrange(coherence)
+near_con <- tab %>% filter(abs(consistency - CONSIST_CUT) <= 10) %>% transmute(cell, consistency) %>% arrange(consistency)
+cat(sprintf("coherence within %d+/-10:   ", COHER_CUT),
     paste(sprintf("%s(%d)", near_coh$cell, near_coh$coherence), collapse = ", "), "\n")
-cat("consistency within 50+/-10: ",
+cat(sprintf("consistency within %d+/-10: ", CONSIST_CUT),
     paste(sprintf("%s(%d)", near_con$cell, near_con$consistency), collapse = ", "), "\n")
+
+cat("\n--- Coherence-cut sensitivity: 75 (range midpoint) vs 66.7 (2:1 odds) ---\n")
+moved <- tab %>%
+  mutate(q75  = coherence >= 75, q667 = coherence >= 200/3) %>%
+  filter(q75 != q667) %>% transmute(cell, coherence)
+if (nrow(moved)) {
+  cat("cells whose coherence classification changes between cuts:\n")
+  print(as.data.frame(moved), row.names = FALSE)
+} else cat("no cell changes classification between the two cuts\n")
 
 cat("\n--- Estimator (a) vs (b) disagreement (argmax-driven flips) ---\n")
 print(as.data.frame(tab %>% filter(flip_a_sig != flip_b) %>%

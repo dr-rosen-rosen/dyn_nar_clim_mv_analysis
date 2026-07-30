@@ -230,19 +230,19 @@ cat(sprintf("\nCV-flip status: %s\n",
 #    Colour = CV-strategy sign stability (no tiering).
 # =============================================================================
 
-ord <- tab %>% arrange(pct_same_sign, pct_dll_pos) %>%
+ord <- tab %>% arrange(pct_modal, pct_dll_pos) %>%
   mutate(cell = sprintf("%s - %s", industry_label, outcome_label)) %>% pull(cell)
 
 plt <- tab %>%
   mutate(cell = factor(sprintf("%s - %s", industry_label, outcome_label), levels = ord)) %>%
-  select(cell, cv_flip_status, pct_dll_pos, pct_same_sign) %>%
-  pivot_longer(c(pct_dll_pos, pct_same_sign), names_to = "panel", values_to = "value") %>%
-  mutate(panel = factor(panel, levels = c("pct_dll_pos","pct_same_sign"),
+  select(cell, cv_flip_status, pct_dll_pos, pct_modal) %>%
+  pivot_longer(c(pct_dll_pos, pct_modal), names_to = "panel", values_to = "value") %>%
+  mutate(panel = factor(panel, levels = c("pct_dll_pos","pct_modal"),
                         labels = c("A. % specifications with held-out gain (dLL > 0)",
-                                   "B. % same sign as best model (among dLL > 0)")))
+                                   "B. % modal-sign consensus (among dLL > 0)")))
 
 ref_df <- tibble(panel = factor(c("A. % specifications with held-out gain (dLL > 0)",
-                                  "B. % same sign as best model (among dLL > 0)"),
+                                  "B. % modal-sign consensus (among dLL > 0)"),
                                 levels = levels(plt$panel)),
                  xint = c(50, 80))
 
@@ -259,7 +259,7 @@ p <- ggplot(plt, aes(value, cell, color = cv_flip_status)) +
                      labels = function(x) paste0(x, "%")) +
   labs(x = NULL, y = NULL,
        title = "Multiverse support for narrative-derived safety climate across outcomes",
-       subtitle = "Panel A: how broadly climate improves held-out prediction (dLL = held-out delta log-likelihood vs baseline).\nPanel B: directional coherence of predictive specifications. Colour = cross-validation sign stability (time-series vs\norganization-blocked). Dashed lines mark 50% (A) and 80% (B) heuristics; cells ordered by coherence.") +
+       subtitle = "Panel A: how broadly climate improves held-out prediction (dLL = held-out delta log-likelihood vs baseline).\nPanel B: directional coherence = consensus share of the credible set's modal sign (bounded 50-100% by construction).\nColour = cross-validation sign stability (time-series vs organization-blocked). Dashed lines mark 50% (A) and 80% (B)\nheuristics; cells ordered by coherence.") +
   theme_minimal(base_size = 10) +
   theme(panel.grid.minor = element_blank(),
         plot.subtitle = element_text(color = "gray40"),
